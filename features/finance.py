@@ -342,7 +342,7 @@ def register_finance(bot):
             bot.answer_callback_query(call.id)
             return
 
-       if data == "finance:graph":
+        if data == "finance:graph":
             bot.answer_callback_query(call.id, "Membuat grafik...")
 
             bio = graph_bytes(user_id)
