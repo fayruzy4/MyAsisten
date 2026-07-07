@@ -363,7 +363,7 @@ def register_finance(bot):
             bot.send_photo(chat_id, photo=bio, caption="📊 Grafik Keuangan")
             return
 
-         if data == "finance:report":
+       if data == "finance:report":
             bot.answer_callback_query(call.id, "Membuat laporan...")
             bio = report_bytes(user_id)
 
