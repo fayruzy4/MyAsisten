@@ -3,6 +3,8 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import BOT_TOKEN, OWNER_ID
 from features.finance import register_finance
+from features.finance_plus import register_finance_plus
+register_finance_plus(bot)
 
 if not BOT_TOKEN:
     raise RuntimeError("TOKEN_BOT belum diisi")
