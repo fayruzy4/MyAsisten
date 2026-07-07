@@ -342,29 +342,43 @@ def register_finance(bot):
             bot.answer_callback_query(call.id)
             return
 
-        if data == "finance:graph":
+       if data == "finance:graph":
             bot.answer_callback_query(call.id, "Membuat grafik...")
+
             bio = graph_bytes(user_id)
-            if bio is None:
-                safe_edit(
-                    bot,
-                    chat_id,
-                    message_id,
-                    "Belum ada transaksi untuk dibuat grafik.",
-                    finance_keyboard(),
-                )
-                return
+
+            bot.send_photo(
+               chat_id,
+               photo=bio,
+               caption="📊 Grafik Keuangan"
+            )
+            show_home(
+               bot,
+               chat_id,
+               message_id,
+               user_id
+            )
+            return
             safe_edit(bot, chat_id, message_id, "📊 Grafik sedang dikirim...", finance_keyboard())
             bot.send_photo(chat_id, photo=bio, caption="📊 Grafik Keuangan")
             return
 
-        if data == "finance:report":
+         if data == "finance:report":
             bot.answer_callback_query(call.id, "Membuat laporan...")
             bio = report_bytes(user_id)
-            safe_edit(bot, chat_id, message_id, "📄 Laporan sedang dikirim...", finance_keyboard())
-            bot.send_photo(chat_id, photo=bio, caption="📄 Laporan Keuangan")
-            return
 
+            bot.send_photo(
+                chat_id,
+                photo=bio,
+                caption="📄 Laporan Keuangan"
+            )
+            show_home(
+                bot,
+                chat_id,
+                message_id,
+                user_id
+            )
+            return
         if data == "finance:recent":
             bot.answer_callback_query(call.id)
             txs = list_transactions(user_id, limit=10, desc=True)
