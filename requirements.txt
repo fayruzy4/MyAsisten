@@ -3,4 +3,4 @@ supabase==2.31.0
 python-dotenv==1.2.2
 matplotlib==3.11.0
 boto3>=1.34.0
-yt-dlp==2025.6.30
+yt-dlp==2025.12.8
