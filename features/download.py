@@ -314,6 +314,15 @@ def register_download(bot):
         clear_pending(message.from_user.id)
         DOWNLOADER_STATE[message.from_user.id] = True
         show_downloader_home(bot, message.chat.id)
+    @bot.callback_query_handler(func=lambda call: call.data == "main:utilitas")
+    def open_utilitas(call):
+        if not allowed(call.from_user.id):
+            bot.answer_callback_query(call.id, "Akses ditolak")
+            return
+
+        clear_pending(call.from_user.id)
+        show_utilitas_home(bot, call.message.chat.id)
+        bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == "util:download")
     def open_downloader(call):
