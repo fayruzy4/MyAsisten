@@ -12,6 +12,11 @@ from features.hutang import (
     show_hutang_home,
     clear_pending as clear_hutang_pending,
 )
+from features.target import (
+    register_target,
+    show_target_home,
+    clear_pending as clear_target_pending,
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("TOKEN_BOT belum diisi")
@@ -20,6 +25,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 handle_finance_text = register_finance(bot)
 handle_hutang_text = register_hutang(bot)
+handle_target_text = register_target(bot)
 
 
 def allowed(user_id: int) -> bool:
@@ -36,6 +42,7 @@ def keuangan_keyboard():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("💵 Catat Keuangan", callback_data="main:catat_keuangan"))
     kb.add(InlineKeyboardButton("💳 Catat Hutang", callback_data="main:hutang"))
+    kb.add(InlineKeyboardButton("🎯 Target", callback_data="main:target"))
     kb.add(InlineKeyboardButton("🏠 Dashboard", callback_data="main:menu"))
     return kb
 
@@ -95,6 +102,7 @@ def start(message):
         return
     clear_finance_pending(message.from_user.id)
     clear_hutang_pending(message.from_user.id)
+    clear_target_pending(message.from_user.id)
     show_main(message.chat.id)
 
 
@@ -105,6 +113,7 @@ def back_main(call):
         return
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
+    clear_target_pending(call.from_user.id)
     show_main(call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -116,6 +125,7 @@ def open_keuangan(call):
         return
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
+    clear_target_pending(call.from_user.id)
     show_keuangan_menu(call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -127,6 +137,7 @@ def open_catat_keuangan(call):
         return
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
+    clear_target_pending(call.from_user.id)
     show_finance_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
@@ -138,7 +149,20 @@ def open_hutang(call):
         return
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
+    clear_target_pending(call.from_user.id)
     show_hutang_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "main:target")
+def open_target(call):
+    if not allowed(call.from_user.id):
+        bot.answer_callback_query(call.id, "Akses ditolak")
+        return
+    clear_finance_pending(call.from_user.id)
+    clear_hutang_pending(call.from_user.id)
+    clear_target_pending(call.from_user.id)
+    show_target_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
 
@@ -148,6 +172,7 @@ def route_text(message):
         return
     handle_finance_text(message)
     handle_hutang_text(message)
+    handle_target_text(message)
 
 
 if __name__ == "__main__":
