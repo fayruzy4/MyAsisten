@@ -1216,6 +1216,154 @@ def register_capsule(bot):
                 clear_pending(user_id)
                 _show_capsule_detail(bot, chat_id, message_id, user_id, capsule_id)
                 return
+def _cancel_keyboard(back_callback: str):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("❌ Batal", callback_data=back_callback))
+    kb.add(InlineKeyboardButton("🏠 Dashboard", callback_data="main:menu"))
+    return kb
+
+
+@bot.message_handler(content_types=["photo", "video", "voice", "document", "location"])
+def capsule_media_handler(message):
+    user_id = message.from_user.id
+    if not allowed(user_id):
+        return
+
+    state = PENDING.get(user_id)
+    if not state or state.get("mode") != "item_add":
+        return
+
+    chat_id = state["chat_id"]
+    message_id = state["message_id"]
+    kind = state["step"]
+    data = state["data"]
+    capsule_id = data.get("capsule_id")
+    capsule = get_capsule(user_id, capsule_id) if capsule_id else None
+
+    if not capsule:
+        clear_pending(user_id)
+        _edit_or_send(bot, chat_id, message_id, "Kapsul tidak ditemukan.", _capsule_home_keyboard())
+        return
+
+    try:
+        if kind == "location":
+            if getattr(message, "content_type", None) != "location" or not getattr(message, "location", None):
+                _edit_or_send(
+                    bot,
+                    chat_id,
+                    message_id,
+                    "Kirim lokasi Telegram.",
+                    _cancel_keyboard(f"cap:view:{capsule_id}"),
+                )
+                return
+
+            loc = message.location
+            add_item(
+                user_id,
+                capsule_id,
+                kind,
+                latitude=float(loc.latitude),
+                longitude=float(loc.longitude),
+            )
+
+        else:
+            content_type = getattr(message, "content_type", None)
+            file_id = None
+            filename = None
+            mime_type = None
+            caption = clean_text(getattr(message, "caption", "") or "")
+
+            if kind == "photo":
+                if content_type != "photo" or not getattr(message, "photo", None):
+                    _edit_or_send(
+                        bot,
+                        chat_id,
+                        message_id,
+                        "Kirim foto.",
+                        _cancel_keyboard(f"cap:view:{capsule_id}"),
+                    )
+                    return
+                file_id = message.photo[-1].file_id
+                filename = f"photo_{uuid.uuid4().hex[:8]}.jpg"
+                mime_type = "image/jpeg"
+
+            elif kind == "video":
+                if content_type != "video" or not getattr(message, "video", None):
+                    _edit_or_send(
+                        bot,
+                        chat_id,
+                        message_id,
+                        "Kirim video.",
+                        _cancel_keyboard(f"cap:view:{capsule_id}"),
+                    )
+                    return
+                file_id = message.video.file_id
+                filename = message.video.file_name or f"video_{uuid.uuid4().hex[:8]}.mp4"
+                mime_type = getattr(message.video, "mime_type", None) or "video/mp4"
+
+            elif kind == "voice":
+                if content_type != "voice" or not getattr(message, "voice", None):
+                    _edit_or_send(
+                        bot,
+                        chat_id,
+                        message_id,
+                        "Kirim voice note.",
+                        _cancel_keyboard(f"cap:view:{capsule_id}"),
+                    )
+                    return
+                file_id = message.voice.file_id
+                filename = f"voice_{uuid.uuid4().hex[:8]}.ogg"
+                mime_type = "audio/ogg"
+
+            elif kind == "document":
+                if content_type != "document" or not getattr(message, "document", None):
+                    _edit_or_send(
+                        bot,
+                        chat_id,
+                        message_id,
+                        "Kirim dokumen.",
+                        _cancel_keyboard(f"cap:view:{capsule_id}"),
+                    )
+                    return
+                file_id = message.document.file_id
+                filename = message.document.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
+                mime_type = getattr(message.document, "mime_type", None) or "application/octet-stream"
+
+            else:
+                _edit_or_send(
+                    bot,
+                    chat_id,
+                    message_id,
+                    "Jenis isi ini tidak didukung.",
+                    _cancel_keyboard(f"cap:view:{capsule_id}"),
+                )
+                return
+
+            raw = _telegram_file_bytes(bot, file_id)
+            key = _r2_key(user_id, capsule_id, kind, filename)
+            _upload_bytes(key, raw, mime_type or "application/octet-stream")
+            add_item(
+                user_id,
+                capsule_id,
+                kind,
+                text_content=caption or None,
+                r2_key=key,
+                file_name=filename,
+                mime_type=mime_type,
+            )
+
+    except Exception:
+        _edit_or_send(
+            bot,
+            chat_id,
+            message_id,
+            "Gagal menyimpan isi kapsul.",
+            _cancel_keyboard(f"cap:view:{capsule_id}"),
+        )
+        return
+
+    clear_pending(user_id)
+    _show_capsule_detail(bot, chat_id, message_id, user_id, capsule_id)
 
     return handle_text
 
