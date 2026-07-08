@@ -17,6 +17,11 @@ from features.target import (
     show_target_home,
     clear_pending as clear_target_pending,
 )
+from features.habit import (
+    register_habit,
+    show_habit_home,
+    clear_pending as clear_habit_pending,
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("TOKEN_BOT belum diisi")
@@ -26,6 +31,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 handle_finance_text = register_finance(bot)
 handle_hutang_text = register_hutang(bot)
 handle_target_text = register_target(bot)
+handle_habit_text = register_habit(bot)
 
 
 def allowed(user_id: int) -> bool:
@@ -35,6 +41,7 @@ def allowed(user_id: int) -> bool:
 def main_keyboard():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("💰 Keuangan", callback_data="main:keuangan"))
+    kb.add(InlineKeyboardButton("🚀 Produktivitas", callback_data="main:produktif"))
     return kb
 
 
@@ -43,6 +50,16 @@ def keuangan_keyboard():
     kb.add(InlineKeyboardButton("💵 Catat Keuangan", callback_data="main:catat_keuangan"))
     kb.add(InlineKeyboardButton("💳 Catat Hutang", callback_data="main:hutang"))
     kb.add(InlineKeyboardButton("🎯 Target", callback_data="main:target"))
+    kb.add(InlineKeyboardButton("🏠 Dashboard", callback_data="main:menu"))
+    return kb
+
+
+def produktivitas_keyboard():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("📅 Habit Tracker", callback_data="main:habit"))
+    kb.add(InlineKeyboardButton("⏳ Kapsul Waktu", callback_data="main:soon:kapsul"))
+    kb.add(InlineKeyboardButton("🎓 Berkas Beasiswa", callback_data="main:soon:beasiswa"))
+    kb.add(InlineKeyboardButton("🎯 Target Masa Depan", callback_data="main:soon:future"))
     kb.add(InlineKeyboardButton("🏠 Dashboard", callback_data="main:menu"))
     return kb
 
@@ -59,6 +76,13 @@ def keuangan_text():
     return (
         "💰 <b>Keuangan</b>\n\n"
         "Silakan pilih submenu yang ingin digunakan."
+    )
+
+
+def produktivitas_text():
+    return (
+        "🚀 <b>Produktivitas</b>\n\n"
+        "Silakan pilih fitur yang ingin digunakan."
     )
 
 
@@ -96,6 +120,23 @@ def show_keuangan_menu(chat_id: int, message_id: int | None = None):
     bot.send_message(chat_id, keuangan_text(), reply_markup=keuangan_keyboard(), parse_mode="HTML")
 
 
+def show_produktivitas_menu(chat_id: int, message_id: int | None = None):
+    if message_id:
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=produktivititas_text(),
+                reply_markup=produktivitas_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass
+
+    bot.send_message(chat_id, produktivitas_text(), reply_markup=produktivitas_keyboard(), parse_mode="HTML")
+
+
 @bot.message_handler(commands=["start"])
 def start(message):
     if not allowed(message.from_user.id):
@@ -103,6 +144,7 @@ def start(message):
     clear_finance_pending(message.from_user.id)
     clear_hutang_pending(message.from_user.id)
     clear_target_pending(message.from_user.id)
+    clear_habit_pending(message.from_user.id)
     show_main(message.chat.id)
 
 
@@ -114,6 +156,7 @@ def back_main(call):
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
     clear_target_pending(call.from_user.id)
+    clear_habit_pending(call.from_user.id)
     show_main(call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -126,6 +169,7 @@ def open_keuangan(call):
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
     clear_target_pending(call.from_user.id)
+    clear_habit_pending(call.from_user.id)
     show_keuangan_menu(call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -138,6 +182,7 @@ def open_catat_keuangan(call):
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
     clear_target_pending(call.from_user.id)
+    clear_habit_pending(call.from_user.id)
     show_finance_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
@@ -150,6 +195,7 @@ def open_hutang(call):
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
     clear_target_pending(call.from_user.id)
+    clear_habit_pending(call.from_user.id)
     show_hutang_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
@@ -162,8 +208,43 @@ def open_target(call):
     clear_finance_pending(call.from_user.id)
     clear_hutang_pending(call.from_user.id)
     clear_target_pending(call.from_user.id)
+    clear_habit_pending(call.from_user.id)
     show_target_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("main:produktif", "main:produktivitas"))
+def open_produktivitas(call):
+    if not allowed(call.from_user.id):
+        bot.answer_callback_query(call.id, "Akses ditolak")
+        return
+    clear_finance_pending(call.from_user.id)
+    clear_hutang_pending(call.from_user.id)
+    clear_target_pending(call.from_user.id)
+    clear_habit_pending(call.from_user.id)
+    show_produktivitas_menu(call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "main:habit")
+def open_habit(call):
+    if not allowed(call.from_user.id):
+        bot.answer_callback_query(call.id, "Akses ditolak")
+        return
+    clear_finance_pending(call.from_user.id)
+    clear_hutang_pending(call.from_user.id)
+    clear_target_pending(call.from_user.id)
+    clear_habit_pending(call.from_user.id)
+    show_habit_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("main:soon:"))
+def soon_feature(call):
+    if not allowed(call.from_user.id):
+        bot.answer_callback_query(call.id, "Akses ditolak")
+        return
+    bot.answer_callback_query(call.id, "Fitur ini sedang disiapkan.")
 
 
 @bot.message_handler(content_types=["text"], func=lambda m: not m.text.startswith("/"))
@@ -173,6 +254,7 @@ def route_text(message):
     handle_finance_text(message)
     handle_hutang_text(message)
     handle_target_text(message)
+    handle_habit_text(message)
 
 
 if __name__ == "__main__":
