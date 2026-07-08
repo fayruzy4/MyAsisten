@@ -335,7 +335,10 @@ def register_download(bot):
         show_utilitas_home(bot, call.message.chat.id)
         bot.answer_callback_query(call.id)
 
-    @bot.message_handler(content_types=["text"], func=lambda m: allowed(m.from_user.id) and m.from_user.id in DOWNLOADER_STATE and not m.text.startswith("/"))
+    @bot.message_handler(
+        content_types=["text"],
+        func=lambda m: allowed(m.from_user.id) and m.from_user.id in DOWNLOADER_STATE and not m.text.startswith("/")
+    )
     def downloader_text_handler(message):
         url = _normalize_url(message.text or "")
         if not url:
@@ -349,7 +352,9 @@ def register_download(bot):
 
         process_downloader_url(bot, message.chat.id, url)
 
-    @bot.message_handler(content_types=["photo", "video", "document", "audio", "voice", "sticker", "animation", "location", "contact"])
+    @bot.message_handler(
+        content_types=["photo", "video", "document", "audio", "voice", "sticker", "animation", "location", "contact"]
+    )
     def downloader_non_text(message):
         if not allowed(message.from_user.id):
             return
@@ -361,4 +366,4 @@ def register_download(bot):
             "Silakan kirim tautan sebagai teks.",
             reply_markup=_downloader_keyboard(),
             parse_mode="HTML",
-        )
+    )
