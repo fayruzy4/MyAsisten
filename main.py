@@ -3,12 +3,14 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import BOT_TOKEN, OWNER_ID
 from features.finance import register_finance, show_finance_home, clear_pending as clear_finance_pending
+from features.hutang import register_hutang, show_hutang_home, clear_pending as clear_hutang_pending
 
 if not BOT_TOKEN:
     raise RuntimeError("TOKEN_BOT belum diisi")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 handle_finance_text = register_finance(bot)
+handle_hutang_text = register_hutang(bot)
 
 
 def allowed(user_id: int) -> bool:
@@ -51,7 +53,17 @@ def start(message):
     if not allowed(message.from_user.id):
         return
     clear_finance_pending(message.from_user.id)
+    clear_hutang_pending(message.from_user.id)
     show_main(message.chat.id)
+
+
+@bot.message_handler(commands=["hutang"])
+def open_hutang_command(message):
+    if not allowed(message.from_user.id):
+        return
+    clear_finance_pending(message.from_user.id)
+    clear_hutang_pending(message.from_user.id)
+    show_hutang_home(bot, message.chat.id, None, message.from_user.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "main:menu")
@@ -60,6 +72,7 @@ def back_main(call):
         bot.answer_callback_query(call.id, "Akses ditolak")
         return
     clear_finance_pending(call.from_user.id)
+    clear_hutang_pending(call.from_user.id)
     show_main(call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -70,7 +83,19 @@ def open_finance(call):
         bot.answer_callback_query(call.id, "Akses ditolak")
         return
     clear_finance_pending(call.from_user.id)
+    clear_hutang_pending(call.from_user.id)
     show_finance_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "main:hutang")
+def open_hutang(call):
+    if not allowed(call.from_user.id):
+        bot.answer_callback_query(call.id, "Akses ditolak")
+        return
+    clear_finance_pending(call.from_user.id)
+    clear_hutang_pending(call.from_user.id)
+    show_hutang_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
 
@@ -79,6 +104,7 @@ def route_text(message):
     if not allowed(message.from_user.id):
         return
     handle_finance_text(message)
+    handle_hutang_text(message)
 
 
 if __name__ == "__main__":
