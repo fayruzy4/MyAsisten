@@ -27,6 +27,10 @@ from features.capsule import (
     show_capsule_home,
     clear_pending as clear_capsule_pending,
 )
+from features.download import (
+    register_download,
+    clear_pending as clear_download_pending,
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("TOKEN_BOT belum diisi")
@@ -38,6 +42,7 @@ handle_hutang_text = register_hutang(bot)
 handle_target_text = register_target(bot)
 handle_habit_text = register_habit(bot)
 handle_capsule_text = register_capsule(bot)
+register_download(bot)
 
 
 def allowed(user_id: int) -> bool:
@@ -48,6 +53,7 @@ def main_keyboard():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("💰 Keuangan", callback_data="main:keuangan"))
     kb.add(InlineKeyboardButton("🚀 Produktivitas", callback_data="main:produktif"))
+    kb.add(InlineKeyboardButton("🛠️ Utilitas", callback_data="main:utilitas"))
     return kb
 
 
@@ -152,6 +158,7 @@ def start(message):
     clear_target_pending(message.from_user.id)
     clear_habit_pending(message.from_user.id)
     clear_capsule_pending(message.from_user.id)
+    clear_download_pending(message.from_user.id)
     show_main(message.chat.id)
 
 
@@ -165,6 +172,7 @@ def back_main(call):
     clear_target_pending(call.from_user.id)
     clear_habit_pending(call.from_user.id)
     clear_capsule_pending(call.from_user.id)
+    clear_download_pending(call.from_user.id)
     show_main(call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -179,6 +187,7 @@ def open_keuangan(call):
     clear_target_pending(call.from_user.id)
     clear_habit_pending(call.from_user.id)
     clear_capsule_pending(call.from_user.id)
+    clear_download_pending(call.from_user.id)
     show_keuangan_menu(call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -193,6 +202,7 @@ def open_catat_keuangan(call):
     clear_target_pending(call.from_user.id)
     clear_habit_pending(call.from_user.id)
     clear_capsule_pending(call.from_user.id)
+    clear_download_pending(call.from_user.id)
     show_finance_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
@@ -207,6 +217,7 @@ def open_hutang(call):
     clear_target_pending(call.from_user.id)
     clear_habit_pending(call.from_user.id)
     clear_capsule_pending(call.from_user.id)
+    clear_download_pending(call.from_user.id)
     show_hutang_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
@@ -221,6 +232,7 @@ def open_target(call):
     clear_target_pending(call.from_user.id)
     clear_habit_pending(call.from_user.id)
     clear_capsule_pending(call.from_user.id)
+    clear_download_pending(call.from_user.id)
     show_target_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
@@ -235,6 +247,7 @@ def open_produktivitas(call):
     clear_target_pending(call.from_user.id)
     clear_habit_pending(call.from_user.id)
     clear_capsule_pending(call.from_user.id)
+    clear_download_pending(call.from_user.id)
     show_produktivitas_menu(call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -249,6 +262,7 @@ def open_habit(call):
     clear_target_pending(call.from_user.id)
     clear_habit_pending(call.from_user.id)
     clear_capsule_pending(call.from_user.id)
+    clear_download_pending(call.from_user.id)
     show_habit_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
@@ -263,6 +277,7 @@ def open_capsule(call):
     clear_target_pending(call.from_user.id)
     clear_habit_pending(call.from_user.id)
     clear_capsule_pending(call.from_user.id)
+    clear_download_pending(call.from_user.id)
     show_capsule_home(bot, call.message.chat.id, call.message.message_id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
