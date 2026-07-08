@@ -1,10 +1,10 @@
 import html
 import os
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import date, datetime, timedelta
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import boto3
 import matplotlib
@@ -56,6 +56,16 @@ ITEM_TYPES = [
     ("🔗 Link", "link"),
     ("📍 Lokasi", "location"),
 ]
+
+ITEM_SHORT = {
+    "text": "📝",
+    "photo": "📷",
+    "video": "🎥",
+    "voice": "🎤",
+    "document": "📄",
+    "link": "🔗",
+    "location": "📍",
+}
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
@@ -122,6 +132,13 @@ def days_left(open_date: Any) -> int:
     return (d - today_date()).days
 
 
+def truncate_text(value: Any, max_len: int = 80) -> str:
+    text = clean_text(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
 def _r2_client():
     global _R2_CLIENT
     if _R2_CLIENT is not None:
@@ -168,6 +185,24 @@ def _telegram_file_bytes(bot, file_id: str) -> bytes:
     return bot.download_file(file_info.file_path)
 
 
+def _q(table: str):
+    return supabase.table(table)
+
+
+def clear_pending(user_id: int):
+    PENDING.pop(user_id, None)
+
+
+def _set_pending(user_id: int, chat_id: int, message_id: int, mode: str, step: str, data: Optional[Dict[str, Any]] = None):
+    PENDING[user_id] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "mode": mode,
+        "step": step,
+        "data": data or {},
+    }
+
+
 def _edit_or_send(bot, chat_id: int, message_id: Optional[int], text: str, markup=None):
     if message_id:
         try:
@@ -189,22 +224,17 @@ def _send_photo(bot, chat_id: int, bio, caption: str, markup=None):
     bot.send_photo(chat_id, photo=bio, caption=caption, reply_markup=markup, parse_mode="HTML")
 
 
-def clear_pending(user_id: int):
-    PENDING.pop(user_id, None)
+def _single_button_keyboard(label: str, callback_data: str):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(label, callback_data=callback_data))
+    return kb
 
 
-def _set_pending(user_id: int, chat_id: int, message_id: int, mode: str, step: str, data: Optional[Dict[str, Any]] = None):
-    PENDING[user_id] = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "mode": mode,
-        "step": step,
-        "data": data or {},
-    }
-
-
-def _q(table: str):
-    return supabase.table(table)
+def _back_keyboard(back_callback: str):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("❌ Batal", callback_data=back_callback))
+    kb.add(InlineKeyboardButton("🏠 Dashboard", callback_data="main:menu"))
+    return kb
 
 
 def refresh_capsules(user_id: int):
@@ -396,10 +426,9 @@ def _capsule_progress_label(capsule: Dict[str, Any]) -> str:
 def _capsule_detail_text(capsule: Dict[str, Any], items: List[Dict[str, Any]]) -> str:
     counts = capsule_counts(capsule["id"], items)
     type_lines = []
-    for label, kind in ITEM_TYPES:
-        short = {"text": "📝", "photo": "📷", "video": "🎥", "voice": "🎤", "document": "📄", "link": "🔗", "location": "📍"}[kind]
+    for _, kind in ITEM_TYPES:
         if counts.get(kind, 0):
-            type_lines.append(f"{short} {counts.get(kind, 0)}")
+            type_lines.append(f"{ITEM_SHORT[kind]} {counts.get(kind, 0)}")
     type_summary = " | ".join(type_lines) if type_lines else "-"
 
     return (
@@ -533,8 +562,7 @@ def _item_pick_keyboard(capsule_id: str):
 def _list_keyboard(capsules: List[Dict[str, Any]], filter_status: Optional[str] = None):
     kb = InlineKeyboardMarkup(row_width=1)
     for capsule in capsules:
-        left = _capsule_progress_label(capsule)
-        label = f"{_capsule_status_label(capsule)} {truncate_text(capsule['name'], 26)} • {left}"
+        label = f"{_capsule_status_label(capsule)} {truncate_text(capsule['name'], 26)} • {_capsule_progress_label(capsule)}"
         kb.add(InlineKeyboardButton(label, callback_data=f"cap:view:{capsule['id']}"))
     kb.add(
         InlineKeyboardButton("➕ Buat Kapsul", callback_data="cap:create"),
@@ -623,12 +651,15 @@ def _caption_for_item(item: Dict[str, Any]) -> str:
 
 def _send_capsule_item(bot, chat_id: int, item: Dict[str, Any]):
     kind = item["item_type"]
+
     if kind == "text":
         bot.send_message(chat_id, f"📝 <b>Pesan</b>\n\n{escape(item.get('text_content') or '-')}", parse_mode="HTML")
         return
+
     if kind == "link":
         bot.send_message(chat_id, f"🔗 <b>Link</b>\n\n{escape(item.get('text_content') or '-')}", parse_mode="HTML")
         return
+
     if kind == "location":
         lat = float(item.get("latitude"))
         lon = float(item.get("longitude"))
@@ -698,7 +729,7 @@ def _list_text(title: str, capsules: List[Dict[str, Any]]) -> str:
     for c in capsules:
         lines.append(
             f"• <b>{escape(c['name'])}</b>\n"
-            f"  { _capsule_status_label(c) }\n"
+            f"  {_capsule_status_label(c)}\n"
             f"  Dibuka: <b>{date_text(c.get('open_date'))}</b>\n"
             f"  Sisa: <b>{_capsule_progress_label(c)}</b>\n"
         )
@@ -781,13 +812,6 @@ def _item_prompt(kind: str) -> str:
     if kind == "document":
         return "📄 Kirim dokumen."
     return "Kirim isi kapsul."
-
-
-def _reflection_text() -> str:
-    return (
-        "💬 <b>Refleksi Kapsul</b>\n\n"
-        "Tuliskan satu kalimat perasaanmu, lalu tulis refleksi singkat tentang isi kapsul ini."
-    )
 
 
 def register_capsule(bot):
@@ -926,9 +950,7 @@ def register_capsule(bot):
                 chat_id,
                 message_id,
                 _item_prompt(kind),
-                InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("❌ Batal", callback_data=f"cap:view:{capsule_id}")
-                ),
+                _back_keyboard(f"cap:view:{capsule_id}"),
             )
             bot.answer_callback_query(call.id)
             return
@@ -1036,9 +1058,7 @@ def register_capsule(bot):
                 chat_id,
                 message_id,
                 f"✏️ <b>Edit Kapsul</b>\n\n{prompts.get(field, 'Kirim nilai baru.')}",
-                InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("❌ Batal", callback_data=f"cap:view:{capsule_id}")
-                ),
+                _back_keyboard(f"cap:view:{capsule_id}"),
             )
             bot.answer_callback_query(call.id)
             return
@@ -1057,14 +1077,112 @@ def register_capsule(bot):
                 chat_id,
                 message_id,
                 "💬 <b>Refleksi Kapsul</b>\n\nTuliskan satu kata perasaanmu dulu.",
-                InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("❌ Batal", callback_data=f"cap:view:{capsule_id}")
-                ),
+                _back_keyboard(f"cap:view:{capsule_id}"),
             )
             bot.answer_callback_query(call.id)
             return
 
         bot.answer_callback_query(call.id)
+
+    @bot.message_handler(content_types=["photo", "video", "voice", "document", "location"])
+    def capsule_media_handler(message):
+        user_id = message.from_user.id
+        if not allowed(user_id):
+            return
+
+        state = PENDING.get(user_id)
+        if not state or state.get("mode") != "item_add":
+            return
+
+        chat_id = state["chat_id"]
+        message_id = state["message_id"]
+        kind = state["step"]
+        data = state["data"]
+        capsule_id = data.get("capsule_id")
+        capsule = get_capsule(user_id, capsule_id) if capsule_id else None
+
+        if not capsule:
+            clear_pending(user_id)
+            _edit_or_send(bot, chat_id, message_id, "Kapsul tidak ditemukan.", _capsule_home_keyboard())
+            return
+
+        try:
+            if kind == "location":
+                if getattr(message, "content_type", None) != "location" or not getattr(message, "location", None):
+                    _edit_or_send(bot, chat_id, message_id, "Kirim lokasi Telegram.", _back_keyboard(f"cap:view:{capsule_id}"))
+                    return
+
+                loc = message.location
+                add_item(
+                    user_id,
+                    capsule_id,
+                    kind,
+                    latitude=float(loc.latitude),
+                    longitude=float(loc.longitude),
+                )
+
+            else:
+                content_type = getattr(message, "content_type", None)
+                file_id = None
+                filename = None
+                mime_type = None
+                caption = clean_text(getattr(message, "caption", "") or "")
+
+                if kind == "photo":
+                    if content_type != "photo" or not getattr(message, "photo", None):
+                        _edit_or_send(bot, chat_id, message_id, "Kirim foto.", _back_keyboard(f"cap:view:{capsule_id}"))
+                        return
+                    file_id = message.photo[-1].file_id
+                    filename = f"photo_{uuid.uuid4().hex[:8]}.jpg"
+                    mime_type = "image/jpeg"
+
+                elif kind == "video":
+                    if content_type != "video" or not getattr(message, "video", None):
+                        _edit_or_send(bot, chat_id, message_id, "Kirim video.", _back_keyboard(f"cap:view:{capsule_id}"))
+                        return
+                    file_id = message.video.file_id
+                    filename = message.video.file_name or f"video_{uuid.uuid4().hex[:8]}.mp4"
+                    mime_type = getattr(message.video, "mime_type", None) or "video/mp4"
+
+                elif kind == "voice":
+                    if content_type != "voice" or not getattr(message, "voice", None):
+                        _edit_or_send(bot, chat_id, message_id, "Kirim voice note.", _back_keyboard(f"cap:view:{capsule_id}"))
+                        return
+                    file_id = message.voice.file_id
+                    filename = f"voice_{uuid.uuid4().hex[:8]}.ogg"
+                    mime_type = "audio/ogg"
+
+                elif kind == "document":
+                    if content_type != "document" or not getattr(message, "document", None):
+                        _edit_or_send(bot, chat_id, message_id, "Kirim dokumen.", _back_keyboard(f"cap:view:{capsule_id}"))
+                        return
+                    file_id = message.document.file_id
+                    filename = message.document.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
+                    mime_type = getattr(message.document, "mime_type", None) or "application/octet-stream"
+
+                else:
+                    _edit_or_send(bot, chat_id, message_id, "Jenis isi ini tidak didukung.", _back_keyboard(f"cap:view:{capsule_id}"))
+                    return
+
+                raw = _telegram_file_bytes(bot, file_id)
+                key = _r2_key(user_id, capsule_id, kind, filename)
+                _upload_bytes(key, raw, mime_type or "application/octet-stream")
+                add_item(
+                    user_id,
+                    capsule_id,
+                    kind,
+                    text_content=caption or None,
+                    r2_key=key,
+                    file_name=filename,
+                    mime_type=mime_type,
+                )
+
+        except Exception:
+            _edit_or_send(bot, chat_id, message_id, "Gagal menyimpan isi kapsul.", _back_keyboard(f"cap:view:{capsule_id}"))
+            return
+
+        clear_pending(user_id)
+        _show_capsule_detail(bot, chat_id, message_id, user_id, capsule_id)
 
     def handle_text(message):
         user_id = message.from_user.id
@@ -1112,8 +1230,7 @@ def register_capsule(bot):
                 _edit_or_send(bot, chat_id, message_id, _summary_text(data), _confirm_keyboard())
                 return
 
-            if step == "confirm":
-                return
+            return
 
         if mode == "edit":
             capsule_id = data.get("capsule_id")
@@ -1162,17 +1279,8 @@ def register_capsule(bot):
                         return
                     add_item(user_id, capsule_id, kind, text_content=text[:4000])
                 elif kind == "location":
-                    if not getattr(message, "location", None):
-                        _edit_or_send(bot, chat_id, message_id, "Kirim lokasi Telegram.", _item_pick_keyboard(capsule_id))
-                        return
-                    loc = message.location
-                    add_item(
-                        user_id,
-                        capsule_id,
-                        kind,
-                        latitude=float(loc.latitude),
-                        longitude=float(loc.longitude),
-                    )
+                    _edit_or_send(bot, chat_id, message_id, "Kirim lokasi Telegram.", _item_pick_keyboard(capsule_id))
+                    return
                 else:
                     _edit_or_send(bot, chat_id, message_id, "Kirim file sesuai jenisnya.", _item_pick_keyboard(capsule_id))
                     return
@@ -1194,182 +1302,23 @@ def register_capsule(bot):
 
             if step == "feel":
                 if not text:
-                    _edit_or_send(bot, chat_id, message_id, "Isi perasaan tidak boleh kosong.", InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Batal", callback_data=f"cap:view:{capsule_id}")))
+                    _edit_or_send(bot, chat_id, message_id, "Isi perasaan tidak boleh kosong.", _back_keyboard(f"cap:view:{capsule_id}"))
                     return
                 data["feel"] = text[:80]
                 state["step"] = "note"
                 PENDING[user_id] = state
-                _edit_or_send(
-                    bot,
-                    chat_id,
-                    message_id,
-                    "📝 Tuliskan refleksi singkatmu.",
-                    InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Batal", callback_data=f"cap:view:{capsule_id}")),
-                )
+                _edit_or_send(bot, chat_id, message_id, "📝 Tuliskan refleksi singkatmu.", _back_keyboard(f"cap:view:{capsule_id}"))
                 return
 
             if step == "note":
                 if not text:
-                    _edit_or_send(bot, chat_id, message_id, "Refleksi tidak boleh kosong.", InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Batal", callback_data=f"cap:view:{capsule_id}")))
+                    _edit_or_send(bot, chat_id, message_id, "Refleksi tidak boleh kosong.", _back_keyboard(f"cap:view:{capsule_id}"))
                     return
                 add_reflection(user_id, capsule_id, data.get("feel") or "-", text[:2000])
                 clear_pending(user_id)
                 _show_capsule_detail(bot, chat_id, message_id, user_id, capsule_id)
                 return
-def _cancel_keyboard(back_callback: str):
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("❌ Batal", callback_data=back_callback))
-    kb.add(InlineKeyboardButton("🏠 Dashboard", callback_data="main:menu"))
-    return kb
 
-
-@bot.message_handler(content_types=["photo", "video", "voice", "document", "location"])
-def capsule_media_handler(message):
-    user_id = message.from_user.id
-    if not allowed(user_id):
         return
-
-    state = PENDING.get(user_id)
-    if not state or state.get("mode") != "item_add":
-        return
-
-    chat_id = state["chat_id"]
-    message_id = state["message_id"]
-    kind = state["step"]
-    data = state["data"]
-    capsule_id = data.get("capsule_id")
-    capsule = get_capsule(user_id, capsule_id) if capsule_id else None
-
-    if not capsule:
-        clear_pending(user_id)
-        _edit_or_send(bot, chat_id, message_id, "Kapsul tidak ditemukan.", _capsule_home_keyboard())
-        return
-
-    try:
-        if kind == "location":
-            if getattr(message, "content_type", None) != "location" or not getattr(message, "location", None):
-                _edit_or_send(
-                    bot,
-                    chat_id,
-                    message_id,
-                    "Kirim lokasi Telegram.",
-                    _cancel_keyboard(f"cap:view:{capsule_id}"),
-                )
-                return
-
-            loc = message.location
-            add_item(
-                user_id,
-                capsule_id,
-                kind,
-                latitude=float(loc.latitude),
-                longitude=float(loc.longitude),
-            )
-
-        else:
-            content_type = getattr(message, "content_type", None)
-            file_id = None
-            filename = None
-            mime_type = None
-            caption = clean_text(getattr(message, "caption", "") or "")
-
-            if kind == "photo":
-                if content_type != "photo" or not getattr(message, "photo", None):
-                    _edit_or_send(
-                        bot,
-                        chat_id,
-                        message_id,
-                        "Kirim foto.",
-                        _cancel_keyboard(f"cap:view:{capsule_id}"),
-                    )
-                    return
-                file_id = message.photo[-1].file_id
-                filename = f"photo_{uuid.uuid4().hex[:8]}.jpg"
-                mime_type = "image/jpeg"
-
-            elif kind == "video":
-                if content_type != "video" or not getattr(message, "video", None):
-                    _edit_or_send(
-                        bot,
-                        chat_id,
-                        message_id,
-                        "Kirim video.",
-                        _cancel_keyboard(f"cap:view:{capsule_id}"),
-                    )
-                    return
-                file_id = message.video.file_id
-                filename = message.video.file_name or f"video_{uuid.uuid4().hex[:8]}.mp4"
-                mime_type = getattr(message.video, "mime_type", None) or "video/mp4"
-
-            elif kind == "voice":
-                if content_type != "voice" or not getattr(message, "voice", None):
-                    _edit_or_send(
-                        bot,
-                        chat_id,
-                        message_id,
-                        "Kirim voice note.",
-                        _cancel_keyboard(f"cap:view:{capsule_id}"),
-                    )
-                    return
-                file_id = message.voice.file_id
-                filename = f"voice_{uuid.uuid4().hex[:8]}.ogg"
-                mime_type = "audio/ogg"
-
-            elif kind == "document":
-                if content_type != "document" or not getattr(message, "document", None):
-                    _edit_or_send(
-                        bot,
-                        chat_id,
-                        message_id,
-                        "Kirim dokumen.",
-                        _cancel_keyboard(f"cap:view:{capsule_id}"),
-                    )
-                    return
-                file_id = message.document.file_id
-                filename = message.document.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
-                mime_type = getattr(message.document, "mime_type", None) or "application/octet-stream"
-
-            else:
-                _edit_or_send(
-                    bot,
-                    chat_id,
-                    message_id,
-                    "Jenis isi ini tidak didukung.",
-                    _cancel_keyboard(f"cap:view:{capsule_id}"),
-                )
-                return
-
-            raw = _telegram_file_bytes(bot, file_id)
-            key = _r2_key(user_id, capsule_id, kind, filename)
-            _upload_bytes(key, raw, mime_type or "application/octet-stream")
-            add_item(
-                user_id,
-                capsule_id,
-                kind,
-                text_content=caption or None,
-                r2_key=key,
-                file_name=filename,
-                mime_type=mime_type,
-            )
-
-    except Exception:
-        _edit_or_send(
-            bot,
-            chat_id,
-            message_id,
-            "Gagal menyimpan isi kapsul.",
-            _cancel_keyboard(f"cap:view:{capsule_id}"),
-        )
-        return
-
-    clear_pending(user_id)
-    _show_capsule_detail(bot, chat_id, message_id, user_id, capsule_id)
 
     return handle_text
-
-
-def truncate_text(value: Any, max_len: int = 80) -> str:
-    text = clean_text(value)
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1].rstrip() + " "
