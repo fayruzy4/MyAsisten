@@ -33,6 +33,20 @@ PLATFORM_LABELS = {
     "generic": "Platform",
 }
 
+# Prefer targets that are known to exist in newer yt-dlp / curl_cffi stacks.
+# yt-dlp accepts CLIENT[:OS] as documented in its README:
+# https://github.com/yt-dlp/yt-dlp#impersonation
+IMPERSONATE_TARGETS = [
+    "Chrome-131:Android-14",
+    "Chrome-142:Macos-26",
+    "Chrome-124:Macos-14",
+    "Firefox-135:Macos-14",
+    "Safari-18.4:Ios-18.4",
+    "Chrome-101:Windows-10",
+    "Safari-17.0:Macos-14",
+    "",
+]
+
 
 def allowed(user_id: int) -> bool:
     return OWNER_ID == 0 or user_id == OWNER_ID
@@ -192,13 +206,8 @@ def _gather_download_paths(ydl, info: dict, tmpdir: str) -> list[Path]:
     return unique
 
 
-def _download_with_ytdlp(url: str, tmpdir: str):
-    try:
-        from yt_dlp import YoutubeDL
-    except ImportError as exc:
-        raise RuntimeError("Paket yt-dlp belum terpasang di VPS.") from exc
-
-    ydl_opts = {
+def _make_ytdlp_opts(tmpdir: str, impersonate: Optional[str] = None) -> Dict[str, Any]:
+    opts: Dict[str, Any] = {
         "format": "bv*+ba/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(tmpdir, "%(title).200s-%(id)s.%(ext)s"),
@@ -207,14 +216,54 @@ def _download_with_ytdlp(url: str, tmpdir: str):
         "restrictfilenames": True,
         "noplaylist": False,
         "ignoreerrors": True,
-        "socket_timeout": 20,
+        "socket_timeout": 25,
         "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 3,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            )
+        },
     }
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True) or {}
-        paths = _gather_download_paths(ydl, info, tmpdir)
-        return info, paths
+    if impersonate is not None:
+        opts["impersonate"] = impersonate
+
+    return opts
+
+
+def _download_with_ytdlp(url: str, tmpdir: str):
+    try:
+        from yt_dlp import YoutubeDL
+        from yt_dlp.utils import DownloadError, YoutubeDLError
+    except ImportError as exc:
+        raise RuntimeError("Paket yt-dlp belum terpasang di VPS.") from exc
+
+    last_error: Optional[Exception] = None
+
+    for target in IMPERSONATE_TARGETS:
+        try:
+            ydl_opts = _make_ytdlp_opts(tmpdir, impersonate=target if target != "" else "")
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True) or {}
+                paths = _gather_download_paths(ydl, info, tmpdir)
+                if paths:
+                    return info, paths
+
+                last_error = RuntimeError("Media tidak ditemukan dari tautan ini.")
+        except (DownloadError, YoutubeDLError, RuntimeError) as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if last_error is None:
+        raise RuntimeError("Media tidak ditemukan dari tautan ini.")
+    raise last_error
 
 
 def _send_local_path(bot, chat_id: int, path: Path, platform: str, title: str) -> int:
@@ -300,6 +349,15 @@ def process_downloader_url(bot, chat_id: int, url: str):
 
 
 def register_download(bot):
+    @bot.callback_query_handler(func=lambda call: call.data == "main:utilitas")
+    def open_utilitas(call):
+        if not allowed(call.from_user.id):
+            bot.answer_callback_query(call.id, "Akses ditolak")
+            return
+        clear_pending(call.from_user.id)
+        show_utilitas_home(bot, call.message.chat.id)
+        bot.answer_callback_query(call.id)
+
     @bot.message_handler(commands=["utilitas"])
     def cmd_utilitas(message):
         if not allowed(message.from_user.id):
@@ -314,15 +372,6 @@ def register_download(bot):
         clear_pending(message.from_user.id)
         DOWNLOADER_STATE[message.from_user.id] = True
         show_downloader_home(bot, message.chat.id)
-    @bot.callback_query_handler(func=lambda call: call.data == "main:utilitas")
-    def open_utilitas(call):
-        if not allowed(call.from_user.id):
-            bot.answer_callback_query(call.id, "Akses ditolak")
-            return
-
-        clear_pending(call.from_user.id)
-        show_utilitas_home(bot, call.message.chat.id)
-        bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == "util:download")
     def open_downloader(call):
@@ -375,4 +424,4 @@ def register_download(bot):
             "Silakan kirim tautan sebagai teks.",
             reply_markup=_downloader_keyboard(),
             parse_mode="HTML",
-    )
+        )
