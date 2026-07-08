@@ -1,5 +1,8 @@
+# Rewritten from the uploaded capsule module. :contentReference[oaicite:0]{index=0}
+
 import html
 import os
+import traceback
 import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -109,13 +112,34 @@ def db_date(value: Any) -> Optional[date]:
         return value
     if isinstance(value, datetime):
         return value.date()
+
     raw = str(value).strip()
+    if not raw:
+        return None
+
     for pattern in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(raw[:10], pattern).date()
         except ValueError:
             continue
     return None
+
+
+def parse_input_date(value: Any, allow_blank: bool = False, default_today: bool = False) -> Optional[date]:
+    raw = clean_text(value)
+
+    if not raw:
+        if allow_blank:
+            return today_date() if default_today else None
+        raise ValueError("Tanggal kosong.")
+
+    for pattern in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(raw, pattern).date()
+        except ValueError:
+            continue
+
+    raise ValueError("Format tanggal tidak valid.")
 
 
 def date_text(value: Any) -> str:
@@ -193,7 +217,14 @@ def clear_pending(user_id: int):
     PENDING.pop(user_id, None)
 
 
-def _set_pending(user_id: int, chat_id: int, message_id: int, mode: str, step: str, data: Optional[Dict[str, Any]] = None):
+def _set_pending(
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    mode: str,
+    step: str,
+    data: Optional[Dict[str, Any]] = None,
+):
     PENDING[user_id] = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -1178,6 +1209,7 @@ def register_capsule(bot):
                 )
 
         except Exception:
+            traceback.print_exc()
             _edit_or_send(bot, chat_id, message_id, "Gagal menyimpan isi kapsul.", _back_keyboard(f"cap:view:{capsule_id}"))
             return
 
@@ -1285,6 +1317,7 @@ def register_capsule(bot):
                     _edit_or_send(bot, chat_id, message_id, "Kirim file sesuai jenisnya.", _item_pick_keyboard(capsule_id))
                     return
             except Exception:
+                traceback.print_exc()
                 _edit_or_send(bot, chat_id, message_id, "Gagal menyimpan isi kapsul.", _item_pick_keyboard(capsule_id))
                 return
 
