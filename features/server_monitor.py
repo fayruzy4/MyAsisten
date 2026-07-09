@@ -379,6 +379,13 @@ def _ufw_status() -> str:
     return first or "ufw tidak tersedia"
 
 
+def _parse_banned_ip_list(raw_text: str) -> List[str]:
+    raw_text = (raw_text or "").strip()
+    if not raw_text or raw_text in {"-", "None", "none"}:
+        return []
+    return [ip.strip() for ip in raw_text.split(",") if ip.strip()]
+
+
 def _fail2ban_snapshot() -> Dict[str, Any]:
     if not _which("fail2ban-client"):
         return {
@@ -386,6 +393,7 @@ def _fail2ban_snapshot() -> Dict[str, Any]:
             "status": "not-installed",
             "jails": [],
             "banned_total": 0,
+            "jail_details": [],
             "raw": "fail2ban-client tidak ditemukan",
         }
 
@@ -396,11 +404,11 @@ def _fail2ban_snapshot() -> Dict[str, Any]:
             "status": "unknown",
             "jails": [],
             "banned_total": 0,
+            "jail_details": [],
             "raw": "status kosong",
         }
 
-    jails = []
-    banned_total = 0
+    jails: List[str] = []
     for line in status.splitlines():
         if "Jail list:" in line:
             payload = line.split("Jail list:", 1)[1].strip()
@@ -409,24 +417,45 @@ def _fail2ban_snapshot() -> Dict[str, Any]:
             break
 
     jail_details = []
-    for jail in jails[:6]:
+    banned_total = 0
+
+    for jail in jails[:10]:
         jail_text = _exec_text(["fail2ban-client", "status", jail], timeout=8)
+
         banned = 0
         failed = 0
+        banned_ips: List[str] = []
+
         if jail_text:
-            for ln in jail_text.splitlines():
-                if "Currently banned:" in ln:
+            for line in jail_text.splitlines():
+                if "Currently banned:" in line:
                     try:
-                        banned = int(ln.split(":", 1)[1].strip())
+                        banned = int(line.split(":", 1)[1].strip())
                     except Exception:
                         banned = 0
-                if "Currently failed:" in ln:
+                elif "Currently failed:" in line:
                     try:
-                        failed = int(ln.split(":", 1)[1].strip())
+                        failed = int(line.split(":", 1)[1].strip())
                     except Exception:
                         failed = 0
-        banned_total += banned
-        jail_details.append({"jail": jail, "banned": banned, "failed": failed})
+                elif "Banned IP list:" in line:
+                    payload = line.split("Banned IP list:", 1)[1].strip()
+                    banned_ips = _parse_banned_ip_list(payload)
+
+        if banned == 0 and banned_ips:
+            banned = len(banned_ips)
+
+        banned_total += max(banned, len(banned_ips))
+
+        jail_details.append(
+            {
+                "jail": jail,
+                "banned": banned,
+                "failed": failed,
+                "banned_ips": banned_ips,
+                "raw": jail_text.strip() if jail_text else "",
+            }
+        )
 
     return {
         "installed": True,
@@ -437,6 +466,68 @@ def _fail2ban_snapshot() -> Dict[str, Any]:
         "raw": status.strip(),
     }
 
+
+def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
+    prev_f2b = prev.get("fail2ban") or {}
+    cur_f2b = cur.get("fail2ban") or {}
+
+    if not cur_f2b.get("installed"):
+        return
+
+    prev_details = {
+        item.get("jail"): item
+        for item in (prev_f2b.get("jail_details") or [])
+        if item.get("jail")
+    }
+    cur_details = {
+        item.get("jail"): item
+        for item in (cur_f2b.get("jail_details") or [])
+        if item.get("jail")
+    }
+
+    for jail, cur_detail in cur_details.items():
+        prev_detail = prev_details.get(jail, {})
+
+        prev_ips = set(prev_detail.get("banned_ips") or [])
+        cur_ips = set(cur_detail.get("banned_ips") or [])
+
+        new_ips = sorted(cur_ips - prev_ips)
+        removed_ips = sorted(prev_ips - cur_ips)
+
+        if new_ips:
+            body = (
+                f"Jail: <b>{_escape(jail)}</b>\n"
+                f"IP baru diblokir: <b>{len(new_ips)}</b>\n\n"
+                + "\n".join(f"• <code>{_escape(ip)}</code>" for ip in new_ips[:10])
+                + f"\n\nCurrently failed: <b>{_escape(str(cur_detail.get('failed', 0)))}</b>"
+                + f"\nCurrently banned: <b>{_escape(str(cur_detail.get('banned', len(cur_ips))))}</b>"
+                + f"\nTotal banned: <b>{_escape(str(cur_f2b.get('banned_total', 0)))}</b>"
+            )
+            _alert(
+                bot,
+                "Fail2Ban Ban",
+                body,
+                icon="🔒",
+                cooldown_key=f"fail2ban_new_{jail}",
+                cooldown=180,
+            )
+
+        if removed_ips:
+            body = (
+                f"Jail: <b>{_escape(jail)}</b>\n"
+                f"IP di-unban: <b>{len(removed_ips)}</b>\n\n"
+                + "\n".join(f"• <code>{_escape(ip)}</code>" for ip in removed_ips[:10])
+                + f"\n\nCurrently banned: <b>{_escape(str(cur_detail.get('banned', len(cur_ips))))}</b>"
+                + f"\nTotal banned: <b>{_escape(str(cur_f2b.get('banned_total', 0)))}</b>"
+            )
+            _alert(
+                bot,
+                "Fail2Ban Unban",
+                body,
+                icon="🔓",
+                cooldown_key=f"fail2ban_unban_{jail}",
+                cooldown=180,
+            )
 
 def _network_online() -> str:
     try:
@@ -1335,6 +1426,7 @@ def _monitor_loop(bot):
 
                 if prev is not None:
                     _evaluate_monitor_alerts(bot, prev, cur)
+                    _evaluate_fail2ban_alerts(bot, prev, cur)
 
                 MONITOR_LAST_CORE["core"] = cur
 
