@@ -424,4 +424,4 @@ def register_download(bot):
             "Silakan kirim tautan sebagai teks.",
             reply_markup=_downloader_keyboard(),
             parse_mode="HTML",
-        )
+    )
