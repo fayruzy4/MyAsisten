@@ -196,6 +196,7 @@ def _utilitas_keyboard():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
         InlineKeyboardButton("📥 Universal Downloader", callback_data="util:download"),
+        InlineKeyboardButton("🖥️ Monitor Server",callback_data="main:monitor"),
         InlineKeyboardButton("🏠 Dashboard", callback_data="main:menu"),
     )
     return kb
