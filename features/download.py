@@ -2,6 +2,8 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -13,7 +15,6 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 from config import OWNER_ID
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
 
 DOWNLOADER_STATE: Dict[int, bool] = {}
 
@@ -35,19 +36,6 @@ PLATFORM_LABELS = {
     "mediafire": "MediaFire",
     "generic": "Platform",
 }
-
-# yt-dlp supports impersonation via CLIENT[:OS].
-# The targets below are intentionally conservative and ordered from newer to broader fallbacks.
-IMPERSONATE_TARGETS: Tuple[str, ...] = (
-    "Chrome-142:Macos-26",
-    "Chrome-131:Android-14",
-    "Chrome-124:Macos-14",
-    "Firefox-135:Macos-14",
-    "Safari-18.4:Ios-18.4",
-    "Chrome-101:Windows-10",
-    "Safari-17.0:Macos-14",
-    "",
-)
 
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -126,13 +114,19 @@ def _truncate(value: Any, limit: int = 900) -> str:
     return text[: max(0, limit - 1)] + "…"
 
 
+def _slugify(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value or "").strip("_")
+    return cleaned or "plain"
+
+
 def _normalize_url(text: str) -> Optional[str]:
     raw = (text or "").strip()
     if not raw:
         return None
 
     if not re.search(r"^https?://", raw, flags=re.IGNORECASE):
-        if re.search(
+        looks_like_domain = re.match(r"^[\w.-]+\.[a-zA-Z]{2,}([/:?#]|$)", raw)
+        if looks_like_domain or re.search(
             r"\b(?:instagram\.com|tiktok\.com|youtu\.be|youtube\.com|facebook\.com|"
             r"x\.com|twitter\.com|threads\.net|pinterest\.com|reddit\.com|"
             r"vimeo\.com|dailymotion\.com|soundcloud\.com|mediafire\.com)\b",
@@ -148,12 +142,8 @@ def _normalize_url(text: str) -> Optional[str]:
     return match.group(0).rstrip(").,]}>\"'")
 
 
-def _pretty_platform(info: dict, url: str) -> str:
-    extractor = str(info.get("extractor_key") or info.get("extractor") or "").strip().lower()
-    if extractor in PLATFORM_LABELS:
-        return PLATFORM_LABELS[extractor]
-
-    host = urlparse(url).netloc.lower().lstrip("www.")
+def _extract_platform_from_url(url: str) -> str:
+    host = urlparse(url).netloc.lower().removeprefix("www.")
     if host.startswith("m."):
         host = host[2:]
 
@@ -181,6 +171,25 @@ def _pretty_platform(info: dict, url: str) -> str:
     return "Platform"
 
 
+def _targets_for_platform(platform_label: str) -> Tuple[Optional[str], ...]:
+    key = (platform_label or "").strip().lower()
+
+    if key in {"tiktok", "instagram", "facebook", "threads", "x", "twitter"}:
+        return (
+            "Chrome-131:Android-14",
+            "Chrome-142:Macos-26",
+            "Firefox-135:Macos-14",
+            None,
+        )
+
+    return (
+        None,
+        "Chrome-131:Android-14",
+        "Chrome-142:Macos-26",
+        "Firefox-135:Macos-14",
+    )
+
+
 def _utilitas_keyboard():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
@@ -201,14 +210,6 @@ def _safe_send_message(bot, chat_id: int, text: str, **kwargs):
         return bot.send_message(chat_id, text, **kwargs)
     except Exception:
         logger.exception("Failed to send message to chat_id=%s", chat_id)
-        return None
-
-
-def _safe_edit_message(bot, chat_id: int, message_id: int, text: str, **kwargs):
-    try:
-        return bot.edit_message_text(text, chat_id, message_id, **kwargs)
-    except Exception:
-        logger.debug("Edit message failed for chat_id=%s message_id=%s", chat_id, message_id, exc_info=True)
         return None
 
 
@@ -246,20 +247,22 @@ def show_downloader_home(bot, chat_id: int):
 
 def _is_temp_file(path: Path) -> bool:
     name = path.name.lower()
-    if not name:
+    if not name or not path.is_file():
         return True
-    if not path.is_file():
-        return True
+
     try:
         if path.stat().st_size <= 0:
             return True
     except OSError:
         return True
+
     if name.endswith(".part") or ".part." in name:
         return True
+
     for marker in TEMP_SUFFIX_MARKERS:
         if name.endswith(marker):
             return True
+
     return False
 
 
@@ -268,30 +271,27 @@ def _scan_downloaded_files(root_dir: str) -> List[Path]:
     if not base.exists():
         return []
 
-    files: List[Path] = []
+    entries: List[Tuple[float, int, str, Path]] = []
+
     for path in base.rglob("*"):
         if _is_temp_file(path):
             continue
+
         try:
-            if path.stat().st_size > 0:
-                files.append(path)
+            st = path.stat()
         except FileNotFoundError:
             continue
         except OSError:
             logger.debug("Skipping unreadable path: %s", path, exc_info=True)
+            continue
 
-    files.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0.0, p.name.lower()), reverse=True)
-    return files
+        if st.st_size <= 0:
+            continue
 
+        entries.append((st.st_mtime, st.st_size, path.name.lower(), path))
 
-def _make_caption(title: str, platform: str, path: Path, index: int, total: int) -> str:
-    caption = (
-        f"📥 <b>{_escape(_truncate(title, 120))}</b>\n"
-        f"Platform: <b>{_escape(platform)}</b>\n"
-        f"File: <code>{_escape(_truncate(path.name, 100))}</code>\n"
-        f"({index}/{total})"
-    )
-    return _truncate(caption, 900)
+    entries.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [item[3] for item in entries]
 
 
 def _guess_media_kind(path: Path) -> Tuple[str, Optional[str]]:
@@ -322,6 +322,16 @@ def _guess_media_kind(path: Path) -> Tuple[str, Optional[str]]:
     return "document", mime
 
 
+def _make_caption(title: str, platform: str, path: Path, index: int, total: int) -> str:
+    caption = (
+        f"📥 <b>{_escape(_truncate(title, 120))}</b>\n"
+        f"Platform: <b>{_escape(platform)}</b>\n"
+        f"File: <code>{_escape(_truncate(path.name, 100))}</code>\n"
+        f"({index}/{total})"
+    )
+    return _truncate(caption, 900)
+
+
 def _send_document(bot, chat_id: int, fh, caption: str):
     return bot.send_document(chat_id, document=fh, caption=caption, parse_mode="HTML")
 
@@ -343,11 +353,11 @@ def _send_animation(bot, chat_id: int, fh, caption: str):
 
 
 def _send_file_with_fallback(bot, chat_id: int, path: Path, caption: str) -> bool:
-    if not path.exists():
+    if not path.exists() or path.stat().st_size <= 0:
         return False
 
     kind, mime = _guess_media_kind(path)
-    logger.info("Sending file kind=%s mime=%s path=%s", kind, mime, path)
+    logger.debug("Sending file path=%s kind=%s mime=%s", path, kind, mime)
 
     with open(path, "rb") as fh:
         try:
@@ -405,226 +415,125 @@ def _send_file_with_fallback(bot, chat_id: int, path: Path, caption: str) -> boo
                 return False
 
 
-class DownloadProgressReporter:
-    def __init__(self, bot, chat_id: int, source_label: str):
-        self.bot = bot
-        self.chat_id = chat_id
-        self.source_label = source_label
-        self.message = None
-        self.message_id: Optional[int] = None
-        self.last_update = 0.0
-        self.started_at = time.monotonic()
-        self.finished = False
-
-    def start(self, url: str):
-        text = (
-            f"⏳ <b>Memulai unduhan</b>\n"
-            f"Platform: <b>{_escape(self.source_label)}</b>\n"
-            f"URL: <code>{_escape(_truncate(url, 160))}</code>\n\n"
-            f"Menyiapkan koneksi..."
-        )
-        self.message = _safe_send_message(self.bot, self.chat_id, text, parse_mode="HTML")
-        if self.message is not None:
-            self.message_id = getattr(self.message, "message_id", None)
-
-    def _format_progress_text(self, data: dict) -> str:
-        status = str(data.get("status") or "").lower()
-        filename = data.get("filename") or data.get("tmpfilename") or ""
-        downloaded_bytes = data.get("downloaded_bytes")
-        total_bytes = data.get("total_bytes") or data.get("total_bytes_estimate")
-        speed = data.get("speed")
-        eta = data.get("eta")
-
-        parts = [
-            "⬇️ <b>Sedang mengunduh</b>",
-            f"Platform: <b>{_escape(self.source_label)}</b>",
-        ]
-
-        if filename:
-            parts.append(f"File: <code>{_escape(_truncate(Path(str(filename)).name, 120))}</code>")
-
-        if total_bytes and isinstance(downloaded_bytes, (int, float)):
-            try:
-                pct = max(0.0, min(100.0, (float(downloaded_bytes) / float(total_bytes)) * 100.0))
-                parts.append(f"Progress: <b>{pct:.1f}%</b>")
-            except Exception:
-                logger.debug("Failed to compute percentage", exc_info=True)
-
-        if speed:
-            try:
-                parts.append(f"Speed: <b>{_escape(_format_size(float(speed)))}/s</b>")
-            except Exception:
-                logger.debug("Failed to format speed", exc_info=True)
-
-        if eta is not None:
-            try:
-                eta_int = int(float(eta))
-                parts.append(f"ETA: <b>{eta_int}s</b>")
-            except Exception:
-                logger.debug("Failed to format ETA", exc_info=True)
-
-        if status == "finished":
-            parts[0] = "✅ <b>Unduhan selesai, memproses file...</b>"
-
-        elapsed = max(0.0, time.monotonic() - self.started_at)
-        parts.append(f"Elapsed: <b>{elapsed:.1f}s</b>")
-
-        return "\n".join(parts)
-
-    def hook(self, data: dict):
-        try:
-            status = str(data.get("status") or "").lower()
-            now = time.monotonic()
-            should_update = status == "finished" or (now - self.last_update) >= 2.0
-            if not should_update:
-                return
-
-            self.last_update = now
-            if self.message_id is None:
-                return
-
-            text = self._format_progress_text(data)
-            _safe_edit_message(self.bot, self.chat_id, self.message_id, text, parse_mode="HTML")
-            if status == "finished":
-                self.finished = True
-        except Exception:
-            logger.debug("Progress hook failure", exc_info=True)
-
-    def finalize(self, text: str):
-        if self.message_id is None:
-            return
-        _safe_edit_message(self.bot, self.chat_id, self.message_id, text, parse_mode="HTML")
+def _tail_text(text: Optional[str], max_chars: int = 1200) -> str:
+    data = (text or "").strip()
+    if not data:
+        return ""
+    if len(data) <= max_chars:
+        return data
+    return data[-max_chars:]
 
 
-def _format_size(value: float) -> str:
-    if value < 1024:
-        return f"{value:.0f} B"
-    if value < 1024 * 1024:
-        return f"{value / 1024:.1f} KB"
-    if value < 1024 * 1024 * 1024:
-        return f"{value / (1024 * 1024):.1f} MB"
-    return f"{value / (1024 * 1024 * 1024):.1f} GB"
-
-
-def _build_ydl_options(tmpdir: str, impersonate: Optional[str], reporter: DownloadProgressReporter) -> Dict[str, Any]:
-    options: Dict[str, Any] = {
-        "format": "bv*+ba/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": False,
-        "ignoreerrors": False,
-        "restrictfilenames": True,
-        "socket_timeout": 25,
-        "retries": 3,
-        "fragment_retries": 3,
-        "extractor_retries": 3,
-        "concurrent_fragment_downloads": 1,
-        "overwrites": True,
-        "outtmpl": os.path.join(tmpdir, "%(title).200B-%(id)s.%(ext)s"),
-        "paths": {"home": tmpdir},
-        "progress_hooks": [reporter.hook],
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/142.0.0.0 Safari/537.36"
-            )
-        },
-    }
-
-    if impersonate is not None:
-        options["impersonate"] = impersonate
-
-    return options
-
-
-def _download_once(url: str, tmpdir: str, bot, chat_id: int, source_label: str, impersonate: Optional[str]):
-    try:
-        from yt_dlp import YoutubeDL
-        try:
-            from yt_dlp.utils import DownloadError, ExtractorError, PostProcessingError, YoutubeDLError
-        except Exception:
-            from yt_dlp.utils import DownloadError  # type: ignore
-            ExtractorError = DownloadError  # type: ignore[assignment]
-            PostProcessingError = DownloadError  # type: ignore[assignment]
-            YoutubeDLError = DownloadError  # type: ignore[assignment]
-    except ImportError as exc:
-        raise RuntimeError("Paket yt-dlp belum terpasang di VPS.") from exc
-
-    reporter = DownloadProgressReporter(bot, chat_id, source_label)
-    reporter.start(url)
-
-    options = _build_ydl_options(tmpdir, impersonate, reporter)
-
-    with YoutubeDL(options) as ydl:
-        try:
-            info = ydl.extract_info(url, download=True) or {}
-            reporter.finalize(
-                f"✅ <b>Unduhan selesai</b>\n"
-                f"Platform: <b>{_escape(source_label)}</b>\n"
-                f"Memindai file hasil unduhan..."
-            )
-            return info
-        except (DownloadError, ExtractorError, PostProcessingError, YoutubeDLError) as exc:
-            logger.exception("yt-dlp failure with impersonate=%r", impersonate)
-            raise exc
-        except Exception as exc:
-            logger.exception("Unexpected yt-dlp failure with impersonate=%r", impersonate)
-            raise exc
-
-
-def _extract_platform_from_url(url: str) -> str:
-    host = urlparse(url).netloc.lower().lstrip("www.")
-    if host.startswith("m."):
-        host = host[2:]
-
-    host_map = [
-        ("youtu.be", "YouTube"),
-        ("youtube.com", "YouTube"),
-        ("instagram.com", "Instagram"),
-        ("tiktok.com", "TikTok"),
-        ("facebook.com", "Facebook"),
-        ("threads.net", "Threads"),
-        ("x.com", "X"),
-        ("twitter.com", "X"),
-        ("pinterest.com", "Pinterest"),
-        ("reddit.com", "Reddit"),
-        ("vimeo.com", "Vimeo"),
-        ("dailymotion.com", "Dailymotion"),
-        ("soundcloud.com", "SoundCloud"),
-        ("mediafire.com", "MediaFire"),
+def _build_cli_command(url: str, impersonate: Optional[str]) -> List[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--quiet",
+        "--no-warnings",
+        "--format",
+        "bv*+ba/best",
+        "--merge-output-format",
+        "mp4",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
+        "--extractor-retries",
+        "3",
+        "--socket-timeout",
+        "25",
+        "--concurrent-fragments",
+        "1",
+        "--restrict-filenames",
+        "--output",
+        "%(title).200B-%(id)s.%(ext)s",
     ]
 
-    for key, label in host_map:
-        if key in host:
-            return label
-    return "Platform"
+    if impersonate:
+        cmd.extend(["--impersonate", impersonate])
+
+    cmd.append(url)
+    return cmd
 
 
-def _download_with_retries(bot, chat_id: int, url: str, tmpdir: str):
-    source_hint = _extract_platform_from_url(url)
+def _run_one_attempt(url: str, attempt_dir: Path, impersonate: Optional[str], platform_label: str):
+    env = os.environ.copy()
+    env["TMPDIR"] = str(attempt_dir)
+    env["TEMP"] = str(attempt_dir)
+    env["TMP"] = str(attempt_dir)
+
+    cmd = _build_cli_command(url, impersonate)
+    logger.info(
+        "Running yt-dlp attempt platform=%s impersonate=%r cwd=%s",
+        platform_label,
+        impersonate,
+        attempt_dir,
+    )
+
+    result = subprocess.run(
+        cmd,
+        cwd=str(attempt_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1200,
+        check=False,
+    )
+
+    if result.stdout:
+        logger.debug("yt-dlp stdout (tail): %s", _tail_text(result.stdout))
+    if result.stderr:
+        logger.debug("yt-dlp stderr (tail): %s", _tail_text(result.stderr))
+
+    return result
+
+
+def _download_with_retries(url: str, tmpdir: str):
+    platform_label = _extract_platform_from_url(url)
     attempt_errors: List[str] = []
+    targets = _targets_for_platform(platform_label)
 
-    for outer_attempt in range(1, 4):
-        for impersonate in IMPERSONATE_TARGETS:
-            try:
-                info = _download_once(
-                    url=url,
-                    tmpdir=tmpdir,
-                    bot=bot,
-                    chat_id=chat_id,
-                    source_label=source_hint,
-                    impersonate=impersonate if impersonate != "" else "",
+    for attempt_no, impersonate in enumerate(targets, start=1):
+        attempt_dir = Path(tmpdir) / f"attempt_{attempt_no}_{_slugify(impersonate or 'plain')}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            result = _run_one_attempt(url, attempt_dir, impersonate, platform_label)
+            files = _scan_downloaded_files(str(attempt_dir))
+
+            if files:
+                if result.returncode != 0:
+                    logger.warning(
+                        "yt-dlp returned non-zero but files were found. rc=%s platform=%s impersonate=%r",
+                        result.returncode,
+                        platform_label,
+                        impersonate,
+                    )
+                return platform_label, files
+
+            error_tail = _tail_text(result.stderr or result.stdout)
+            if result.returncode == 0:
+                raise RuntimeError(
+                    "Media tidak ditemukan dari tautan ini."
+                    + (f"\n{error_tail}" if error_tail else "")
                 )
-                files = _scan_downloaded_files(tmpdir)
-                if files:
-                    return info, files, source_hint
-                raise RuntimeError("Media tidak ditemukan dari tautan ini.")
-            except Exception as exc:
-                msg = f"attempt={outer_attempt} impersonate={impersonate!r} error={exc.__class__.__name__}: {exc}"
-                attempt_errors.append(msg)
-                logger.exception("Download attempt failed: %s", msg)
-                time.sleep(min(3.0, 0.8 * outer_attempt))
+
+            raise RuntimeError(
+                f"yt-dlp gagal (rc={result.returncode})."
+                + (f"\n{error_tail}" if error_tail else "")
+            )
+
+        except subprocess.TimeoutExpired:
+            msg = f"attempt={attempt_no} impersonate={impersonate!r} error=TimeoutExpired"
+            attempt_errors.append(msg)
+            logger.exception("Download timeout: %s", msg)
+            time.sleep(0.5)
+        except Exception as exc:
+            msg = f"attempt={attempt_no} impersonate={impersonate!r} error={exc.__class__.__name__}: {exc}"
+            attempt_errors.append(msg)
+            logger.exception("Download attempt failed: %s", msg)
+            time.sleep(0.5)
 
     raise RuntimeError(
         "Gagal mengunduh media setelah beberapa percobaan.\n"
@@ -635,22 +544,18 @@ def _download_with_retries(bot, chat_id: int, url: str, tmpdir: str):
 def process_downloader_url(bot, chat_id: int, url: str):
     with tempfile.TemporaryDirectory(prefix="universal_downloader_") as tmpdir:
         try:
+            platform_label = _extract_platform_from_url(url)
             _safe_send_message(
                 bot,
                 chat_id,
-                "⏳ <b>Memproses tautan...</b>\n"
-                "Bot sedang menyiapkan unduhan dan mendeteksi platform.",
+                "⏳ <b>Memulai unduhan</b>\n"
+                f"Platform: <b>{_escape(platform_label)}</b>\n"
+                f"URL: <code>{_escape(_truncate(url, 180))}</code>\n\n"
+                "Menyiapkan koneksi...",
                 parse_mode="HTML",
             )
 
-            info, paths, source_label = _download_with_retries(bot, chat_id, url, tmpdir)
-            platform = _pretty_platform(info, url) if isinstance(info, dict) else source_label
-            title = str(
-                (info or {}).get("title")
-                or (info or {}).get("playlist_title")
-                or Path(urlparse(url).path).name
-                or "Media"
-            ).strip()
+            platform_label, paths = _download_with_retries(url, tmpdir)
 
             if not paths:
                 raise RuntimeError("Media tidak ditemukan dari tautan ini.")
@@ -659,7 +564,7 @@ def process_downloader_url(bot, chat_id: int, url: str):
                 bot,
                 chat_id,
                 "✅ <b>File ditemukan</b>\n"
-                f"Platform: <b>{_escape(platform)}</b>\n"
+                f"Platform: <b>{_escape(platform_label)}</b>\n"
                 f"Jumlah file: <b>{len(paths)}</b>\n\n"
                 "Mengirim ke Telegram...",
                 parse_mode="HTML",
@@ -667,10 +572,12 @@ def process_downloader_url(bot, chat_id: int, url: str):
 
             sent = 0
             total = len(paths)
+
+            title = _truncate(paths[0].stem, 120) if paths else "Media"
+
             for index, path in enumerate(paths, start=1):
-                caption = _make_caption(title, platform, path, index, total)
-                ok = _send_file_with_fallback(bot, chat_id, path, caption)
-                if ok:
+                caption = _make_caption(title, platform_label, path, index, total)
+                if _send_file_with_fallback(bot, chat_id, path, caption):
                     sent += 1
                 else:
                     logger.error("Failed to send file after all fallbacks: %s", path)
@@ -678,12 +585,22 @@ def process_downloader_url(bot, chat_id: int, url: str):
             if sent == 0:
                 raise RuntimeError("Tidak ada file yang berhasil dikirim ke Telegram.")
 
+            if sent < total:
+                summary = (
+                    "✅ <b>Download selesai</b>\n\n"
+                    f"Berhasil mengirim <b>{sent}/{total}</b> file.\n"
+                    "Sebagian file gagal dikirim."
+                )
+            else:
+                summary = (
+                    "✅ <b>Download selesai</b>\n\n"
+                    f"Berhasil mengirim <b>{sent}</b> file."
+                )
+
             _safe_send_message(
                 bot,
                 chat_id,
-                "✅ <b>Download selesai</b>\n\n"
-                f"Berhasil mengirim <b>{sent}</b> file.\n"
-                "Silakan kirim tautan lain.",
+                summary + "\nSilakan kirim tautan lain.",
                 reply_markup=_downloader_keyboard(),
                 parse_mode="HTML",
             )
@@ -706,6 +623,7 @@ def register_download(bot):
         if not allowed(call.from_user.id):
             _safe_answer_callback(bot, call.id, "Akses ditolak")
             return
+
         clear_pending(call.from_user.id)
         show_utilitas_home(bot, call.message.chat.id)
         _safe_answer_callback(bot, call.id)
@@ -730,6 +648,7 @@ def register_download(bot):
         if not allowed(call.from_user.id):
             _safe_answer_callback(bot, call.id, "Akses ditolak")
             return
+
         clear_pending(call.from_user.id)
         DOWNLOADER_STATE[call.from_user.id] = True
         show_downloader_home(bot, call.message.chat.id)
@@ -740,6 +659,7 @@ def register_download(bot):
         if not allowed(call.from_user.id):
             _safe_answer_callback(bot, call.id, "Akses ditolak")
             return
+
         clear_pending(call.from_user.id)
         DOWNLOADER_STATE.pop(call.from_user.id, None)
         show_utilitas_home(bot, call.message.chat.id)
