@@ -31,6 +31,11 @@ from features.download import (
     register_download,
     clear_pending as clear_download_pending,
 )
+from features.server_monitor import (
+    register_server_monitor,
+    show_monitor_home,
+    clear_pending as clear_server_monitor_pending,
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("TOKEN_BOT belum diisi")
