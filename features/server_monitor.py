@@ -13,6 +13,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
+import hashlib
+import json
+import platform
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from pathlib import Path
+
+try:
+    import geoip2.database
+except Exception:  # pragma: no cover
+    geoip2 = None  # type: ignore
+
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import OWNER_ID
@@ -49,6 +61,377 @@ MONITOR_ALERT_LAST_AT: Dict[str, float] = {}
 MONITOR_LAST_CHANNEL_TEST_AT: float = 0.0
 MONITOR_LOCK = threading.RLock()
 
+DEFAULT_JOURNAL_SERVICES = {
+    "ssh": ("ssh", "sshd"),
+    "fail2ban": ("fail2ban", "fail2ban-server"),
+}
+
+MONITOR_ALERT_STATE: Dict[str, Dict[str, Any]] = {}
+MONITOR_EVENT_STATE: Dict[str, Dict[str, Any]] = defaultdict(dict)
+MONITOR_SSH_STATS: Dict[str, Any] = {
+    "last_success": "-",
+    "last_failure": "-",
+    "last_disconnect": "-",
+    "accepted": deque(maxlen=200),
+    "failed": deque(maxlen=300),
+    "session_events": deque(maxlen=200),
+}
+MONITOR_FAIL2BAN_STATS: Dict[str, Any] = {
+    "ban_events": deque(maxlen=200),
+    "unban_events": deque(maxlen=200),
+    "failed_counts": deque(maxlen=200),
+    "total_ban": 0,
+}
+MONITOR_NET_BASELINE: Dict[str, Any] = {}
+MONITOR_SERVICE_BASELINE: Dict[str, Dict[str, Any]] = {}
+MONITOR_WATCHER_THREADS: Dict[str, threading.Thread] = {}
+MONITOR_WATCHER_STOP = threading.Event()
+MONITOR_BOOT_NOTICE_SENT = False
+MONITOR_SUPERVISOR_STARTED = False
+MONITOR_SUPERVISOR_LAST_HEARTBEAT = 0.0
+MONITOR_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="monitor-io")
+
+GEOIP_CITY_DB_PATHS = [
+    os.getenv("GEOIP2_CITY_DB"),
+    os.getenv("GEOIP_CITY_DB"),
+    os.getenv("GEOIP_CITY_PATH"),
+    "/opt/geolite2/GeoLite2-City.mmdb",
+    "/usr/share/GeoIP/GeoLite2-City.mmdb",
+    "/var/lib/GeoIP/GeoLite2-City.mmdb",
+    "/root/GeoLite2-City.mmdb",
+]
+GEOIP_ASN_DB_PATHS = [
+    os.getenv("GEOIP2_ASN_DB"),
+    os.getenv("GEOIP_ASN_DB"),
+    os.getenv("GEOIP_ASN_PATH"),
+    "/opt/geolite2/GeoLite2-ASN.mmdb",
+    "/usr/share/GeoIP/GeoLite2-ASN.mmdb",
+    "/var/lib/GeoIP/GeoLite2-ASN.mmdb",
+    "/root/GeoLite2-ASN.mmdb",
+]
+
+GEOIP_CACHE: Dict[str, Dict[str, Any]] = {}
+GEOIP_READER_CITY = None
+GEOIP_READER_ASN = None
+
+MONITOR_BW_SPIKE_BPS = max(1_000_000, int(os.getenv("MONITOR_BW_SPIKE_BPS", str(80 * 1024 * 1024))))
+MONITOR_IO_HIGH_BPS = max(1_000_000, int(os.getenv("MONITOR_IO_HIGH_BPS", str(120 * 1024 * 1024))))
+MONITOR_SSH_BRUTE_FORCE_THRESHOLD = max(3, int(os.getenv("MONITOR_SSH_BRUTE_FORCE_THRESHOLD", "5")))
+MONITOR_SSH_MASS_LOGIN_THRESHOLD = max(5, int(os.getenv("MONITOR_SSH_MASS_LOGIN_THRESHOLD", "10")))
+MONITOR_PORT_SCAN_THRESHOLD = max(10, int(os.getenv("MONITOR_PORT_SCAN_THRESHOLD", "30")))
+MONITOR_SERVICE_DOWN_GRACE = max(15, int(os.getenv("MONITOR_SERVICE_DOWN_GRACE", "30")))
+MONITOR_SERVICE_RESTART_MIN_DELTA = max(1, int(os.getenv("MONITOR_SERVICE_RESTART_MIN_DELTA", "1")))
+MONITOR_DNS_TEST_HOST = os.getenv("MONITOR_DNS_TEST_HOST", "one.one.one.one")
+MONITOR_DNS_TEST_NAME = os.getenv("MONITOR_DNS_TEST_NAME", "google.com")
+
+def _truncate(value: Any, limit: int = 280) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+def report_local_error(source: str, exc: Exception) -> None:
+    try:
+        logger.exception("Monitor error in %s: %s", source, exc)
+    except Exception:
+        pass
+
+def _safe_len(value: Any) -> int:
+    try:
+        return len(value)  # type: ignore[arg-type]
+    except Exception:
+        return 0
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+def _fmt_rate(value: Any) -> str:
+    try:
+        rate = float(value)
+    except Exception:
+        return "-"
+    if rate < 1024:
+        return f"{rate:.0f} B/s"
+    if rate < 1024 ** 2:
+        return f"{rate / 1024:.1f} KB/s"
+    if rate < 1024 ** 3:
+        return f"{rate / 1024 ** 2:.1f} MB/s"
+    return f"{rate / 1024 ** 3:.1f} GB/s"
+
+def _basename_from_service(service: str) -> str:
+    return service.replace(".service", "").strip()
+
+def _service_units(service: str) -> Tuple[str, ...]:
+    service = _basename_from_service(service)
+    if service.endswith(".socket") or service.endswith(".timer"):
+        return (service,)
+    return (service, f"{service}.service")
+
+def _dedupe_ordered(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+def _resolve_geoip_reader(paths: List[str]):
+    if geoip2 is None:
+        return None
+    for raw in paths:
+        if not raw:
+            continue
+        try:
+            path = Path(raw).expanduser()
+            if path.exists():
+                return geoip2.database.Reader(str(path))
+        except Exception:
+            continue
+    return None
+
+def _init_geoip_readers():
+    global GEOIP_READER_CITY, GEOIP_READER_ASN
+    if GEOIP_READER_CITY is None:
+        GEOIP_READER_CITY = _resolve_geoip_reader(GEOIP_CITY_DB_PATHS)
+    if GEOIP_READER_ASN is None:
+        GEOIP_READER_ASN = _resolve_geoip_reader(GEOIP_ASN_DB_PATHS)
+
+def _lookup_reverse_dns(ip: str) -> str:
+    if not ip or ip == "-":
+        return "-"
+    try:
+        host, _, _ = socket.gethostbyaddr(ip)
+        return host or "-"
+    except Exception:
+        return "-"
+
+def _lookup_geoip(ip: str) -> Dict[str, str]:
+    if not ip or ip == "-":
+        return {"country": "-", "flag": "🏳️", "city": "-", "asn": "-", "isp": "-", "reverse_dns": "-"}
+    cached = GEOIP_CACHE.get(ip)
+    if cached:
+        return cached
+    _init_geoip_readers()
+    result = {"country": "-", "flag": "🏳️", "city": "-", "asn": "-", "isp": "-", "reverse_dns": "-"}
+    try:
+        if GEOIP_READER_CITY is not None:
+            city = GEOIP_READER_CITY.city(ip)
+            country = getattr(city.country, "names", {}).get("en") or getattr(city.country, "name", None) or "-"
+            city_name = getattr(city.city, "names", {}).get("en") or getattr(city.city, "name", None) or "-"
+            result["country"] = str(country) if country else "-"
+            result["city"] = str(city_name) if city_name else "-"
+            code = getattr(city.country, "iso_code", "") or ""
+            result["flag"] = _flag_emoji(code)
+        if GEOIP_READER_ASN is not None:
+            asn = GEOIP_READER_ASN.asn(ip)
+            number = getattr(asn, "autonomous_system_number", None)
+            org = getattr(asn, "autonomous_system_organization", None) or getattr(asn, "network", None)
+            result["asn"] = f"AS{number}" if number else "-"
+            result["isp"] = str(org) if org else "-"
+    except Exception:
+        pass
+    result["reverse_dns"] = _lookup_reverse_dns(ip)
+    GEOIP_CACHE[ip] = result
+    return result
+
+def _flag_emoji(country_code: str) -> str:
+    code = (country_code or "").upper()
+    if len(code) != 2 or not code.isalpha():
+        return "🏳️"
+    base = 127397
+    return chr(base + ord(code[0])) + chr(base + ord(code[1]))
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
+
+def _run_text(cmd: List[str], timeout: int = 8) -> str:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return (result.stdout or result.stderr or "").strip()
+    except Exception:
+        return ""
+
+def _run_shell(command: str, timeout: int = 8) -> str:
+    return _run_text(["bash", "-lc", command], timeout=timeout)
+
+def _journal_cmd(units: Tuple[str, ...], follow: bool = False) -> List[str]:
+    cmd = ["journalctl", "--no-pager", "-o", "short-iso", "-n", "0"]
+    if follow:
+        cmd.append("-f")
+    for unit in units:
+        cmd.extend(["-u", unit])
+    return cmd
+
+def _journal_tail_worker(name: str, units: Tuple[str, ...], parser):
+    delay = 2.0
+    while not MONITOR_WATCHER_STOP.is_set():
+        proc = None
+        try:
+            cmd = _journal_cmd(units, follow=True)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if MONITOR_WATCHER_STOP.is_set():
+                    break
+                line = (line or "").rstrip("\n")
+                if line:
+                    try:
+                        parser(line)
+                    except Exception as exc:
+                        report_local_error(f"{name}_parser", exc)
+            rc = proc.wait(timeout=2)
+            logger.warning("journal tail worker %s exited with rc=%s", name, rc)
+        except Exception as exc:
+            report_local_error(f"{name}_watcher", exc)
+        finally:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        time.sleep(delay)
+        delay = min(delay * 1.4, 10.0)
+
+def _ensure_reader_alive(path: str, reader_name: str) -> None:
+    try:
+        if not path:
+            return
+        p = Path(path).expanduser()
+        if not p.exists():
+            logger.warning("%s tidak ditemukan: %s", reader_name, p)
+    except Exception:
+        pass
+
+def _ssh_rate_bucket(ip: str) -> deque:
+    bucket = MONITOR_EVENT_STATE["ssh_failed"][ip]
+    if not isinstance(bucket, deque):
+        bucket = deque(maxlen=100)
+        MONITOR_EVENT_STATE["ssh_failed"][ip] = bucket
+    return bucket
+
+def _fail2ban_rate_bucket(jail: str) -> deque:
+    bucket = MONITOR_EVENT_STATE["fail2ban"][jail]
+    if not isinstance(bucket, deque):
+        bucket = deque(maxlen=100)
+        MONITOR_EVENT_STATE["fail2ban"][jail] = bucket
+    return bucket
+
+def _parse_timestamp_text(line: str) -> str:
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}T[^ ]+)\s", line or "")
+    if match:
+        return match.group(1)
+    return _now_text()
+
+def _peer_from_line(line: str) -> str:
+    m = re.search(r"from\s+([0-9a-fA-F:.]+)", line)
+    return m.group(1) if m else "-"
+
+def _user_from_line(line: str) -> str:
+    patterns = [
+        r"for(?: invalid user)?\s+([A-Za-z0-9._-]+)\s+from",
+        r"session opened for user\s+([A-Za-z0-9._-]+)",
+        r"session closed for user\s+([A-Za-z0-9._-]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, line, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return "-"
+
+def _auth_method_from_line(line: str) -> str:
+    lowered = line.lower()
+    if "publickey" in lowered:
+        return "publickey"
+    if "password" in lowered:
+        return "password"
+    if "keyboard-interactive" in lowered:
+        return "keyboard-interactive"
+    if "gssapi" in lowered:
+        return "gssapi"
+    return "unknown"
+
+def _message_kind_from_ssh(line: str) -> str:
+    lowered = line.lower()
+    if "accepted publickey" in lowered:
+        return "ssh_success"
+    if "accepted password" in lowered:
+        return "ssh_success"
+    if "failed password" in lowered:
+        return "ssh_failed"
+    if "invalid user" in lowered:
+        return "ssh_failed"
+    if "session opened" in lowered:
+        return "ssh_session_open"
+    if "session closed" in lowered:
+        return "ssh_session_close"
+    if "disconnect" in lowered or "received disconnect" in lowered:
+        return "ssh_disconnect"
+    return "ssh_other"
+
+def _message_kind_from_fail2ban(line: str) -> str:
+    lowered = line.lower()
+    if " ban " in f" {lowered} " or " ban:" in lowered:
+        return "fail2ban_ban"
+    if " unban " in f" {lowered} " or " unban:" in lowered:
+        return "fail2ban_unban"
+    if " found " in f" {lowered} ":
+        return "fail2ban_failed"
+    return "fail2ban_other"
+
+def _parse_fail2ban_event(line: str) -> Optional[Dict[str, Any]]:
+    kind = _message_kind_from_fail2ban(line)
+    jail = "-"
+    ip = "-"
+    m = re.search(r"\[(?P<jail>[^\]]+)\].*?(Ban|Unban|Found)\s+(?P<ip>[0-9a-fA-F:.]+)", line, flags=re.IGNORECASE)
+    if m:
+        jail = m.group("jail")
+        ip = m.group("ip")
+    else:
+        m2 = re.search(r"(Ban|Unban|Found)\s+(?P<ip>[0-9a-fA-F:.]+)", line, flags=re.IGNORECASE)
+        if m2:
+            ip = m2.group("ip")
+    if kind == "fail2ban_other":
+        return None
+    return {
+        "kind": kind,
+        "jail": jail,
+        "ip": ip,
+        "timestamp": _parse_timestamp_text(line),
+        "raw": line,
+    }
+
+def _parse_ssh_event(line: str) -> Optional[Dict[str, Any]]:
+    kind = _message_kind_from_ssh(line)
+    if kind == "ssh_other":
+        return None
+    return {
+        "kind": kind,
+        "user": _user_from_line(line),
+        "ip": _peer_from_line(line),
+        "method": _auth_method_from_line(line),
+        "timestamp": _parse_timestamp_text(line),
+        "raw": line,
+        "invalid_user": bool(re.search(r"invalid user", line, flags=re.IGNORECASE)),
+    }
+
+def _event_key(kind: str, ip: str, extra: str = "") -> str:
+    return f"{kind}:{ip}:{extra}".strip(":")
+
+
 
 def allowed(user_id: int) -> bool:
     return OWNER_ID == 0 or user_id == OWNER_ID
@@ -83,6 +466,8 @@ def _fmt_pct(value: Any) -> str:
         return "-"
 
 
+
+
 def _fmt_duration(seconds: Any) -> str:
     try:
         total = int(float(seconds))
@@ -93,11 +478,15 @@ def _fmt_duration(seconds: Any) -> str:
     days, rem = divmod(total, 86400)
     hours, rem = divmod(rem, 3600)
     minutes, secs = divmod(rem, 60)
+    parts: List[str] = []
     if days:
-        return f"{days}h {hours:02d}j {minutes:02d}m"
-    if hours:
-        return f"{hours}j {minutes:02d}m {secs:02d}d"
-    return f"{minutes:02d}m {secs:02d}d"
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours:02d}j")
+    if minutes or parts:
+        parts.append(f"{minutes:02d}m")
+    parts.append(f"{secs:02d}s")
+    return " ".join(parts)
 
 
 def _now_text() -> str:
@@ -182,12 +571,57 @@ def _send_channel_log(bot, text: str) -> bool:
         return False
 
 
+
 def _service_status(service: str) -> Dict[str, Any]:
-    state = _exec_text(["systemctl", "is-active", service], timeout=5).strip() or "unknown"
-    enabled = _exec_text(["systemctl", "is-enabled", service], timeout=5).strip() or "unknown"
-    pid = _exec_text(["systemctl", "show", service, "-p", "MainPID", "--value"], timeout=5).strip() or "-"
-    sub = _exec_text(["systemctl", "show", service, "-p", "SubState", "--value"], timeout=5).strip() or "-"
-    return {"status": state, "enabled": enabled, "pid": pid, "sub": sub}
+    unit = _basename_from_service(service)
+    state = _exec_text(["systemctl", "is-active", unit], timeout=5).strip() or "unknown"
+    enabled = _exec_text(["systemctl", "is-enabled", unit], timeout=5).strip() or "unknown"
+    props = {
+        "status": state,
+        "enabled": enabled,
+        "pid": _exec_text(["systemctl", "show", unit, "-p", "MainPID", "--value"], timeout=5).strip() or "-",
+        "sub": _exec_text(["systemctl", "show", unit, "-p", "SubState", "--value"], timeout=5).strip() or "-",
+        "result": _exec_text(["systemctl", "show", unit, "-p", "Result", "--value"], timeout=5).strip() or "-",
+        "exec_code": _exec_text(["systemctl", "show", unit, "-p", "ExecMainCode", "--value"], timeout=5).strip() or "-",
+        "exec_status": _exec_text(["systemctl", "show", unit, "-p", "ExecMainStatus", "--value"], timeout=5).strip() or "-",
+        "n_restarts": _safe_int(_exec_text(["systemctl", "show", unit, "-p", "NRestarts", "--value"], timeout=5).strip(), 0),
+        "active_enter": _safe_float(_exec_text(["systemctl", "show", unit, "-p", "ActiveEnterTimestampMonotonic", "--value"], timeout=5).strip(), 0.0),
+        "inactive_enter": _safe_float(_exec_text(["systemctl", "show", unit, "-p", "InactiveEnterTimestampMonotonic", "--value"], timeout=5).strip(), 0.0),
+        "main_pid": _safe_int(_exec_text(["systemctl", "show", unit, "-p", "MainPID", "--value"], timeout=5).strip(), 0),
+        "fragment": _exec_text(["systemctl", "show", unit, "-p", "FragmentPath", "--value"], timeout=5).strip() or "-",
+    }
+    return props
+
+
+def _service_status(service: str) -> Dict[str, Any]:
+    unit = _basename_from_service(service)
+    state = _exec_text(["systemctl", "is-active", unit], timeout=5).strip() or "unknown"
+    enabled = _exec_text(["systemctl", "is-enabled", unit], timeout=5).strip() or "unknown"
+    props = {
+        "status": state,
+        "enabled": enabled,
+        "pid": _exec_text(["systemctl", "show", unit, "-p", "MainPID", "--value"], timeout=5).strip() or "-",
+        "sub": _exec_text(["systemctl", "show", unit, "-p", "SubState", "--value"], timeout=5).strip() or "-",
+        "result": _exec_text(["systemctl", "show", unit, "-p", "Result", "--value"], timeout=5).strip() or "-",
+        "exec_code": _exec_text(["systemctl", "show", unit, "-p", "ExecMainCode", "--value"], timeout=5).strip() or "-",
+        "exec_status": _exec_text(["systemctl", "show", unit, "-p", "ExecMainStatus", "--value"], timeout=5).strip() or "-",
+        "n_restarts": _safe_int(_exec_text(["systemctl", "show", unit, "-p", "NRestarts", "--value"], timeout=5).strip(), 0),
+        "active_enter": _safe_float(_exec_text(["systemctl", "show", unit, "-p", "ActiveEnterTimestampMonotonic", "--value"], timeout=5).strip(), 0.0),
+        "inactive_enter": _safe_float(_exec_text(["systemctl", "show", unit, "-p", "InactiveEnterTimestampMonotonic", "--value"], timeout=5).strip(), 0.0),
+        "main_pid": _safe_int(_exec_text(["systemctl", "show", unit, "-p", "MainPID", "--value"], timeout=5).strip(), 0),
+        "fragment": _exec_text(["systemctl", "show", unit, "-p", "FragmentPath", "--value"], timeout=5).strip() or "-",
+    }
+    return props
+
+def _service_emoji(state: str) -> str:
+    state = (state or "").lower()
+    if state == "active":
+        return "🟢"
+    if state in {"inactive", "failed"}:
+        return "🔴"
+    if state in {"activating", "reloading", "deactivating"}:
+        return "🟠"
+    return "⚪"
 
 
 def _service_emoji(state: str) -> str:
@@ -203,6 +637,114 @@ def _service_emoji(state: str) -> str:
 
 def _collect_service_states() -> Dict[str, Dict[str, Any]]:
     return {svc: _service_status(svc) for svc in MONITOR_SERVICES}
+
+
+
+def _cpu_temperature_snapshot() -> Tuple[Optional[float], str]:
+    if psutil is None or not hasattr(psutil, "sensors_temperatures"):
+        return None, "sensor unavailable"
+    try:
+        temps = psutil.sensors_temperatures(fahrenheit=False)  # type: ignore[attr-defined]
+    except Exception:
+        return None, "sensor unavailable"
+    if not temps:
+        return None, "sensor unavailable"
+    selected: List[float] = []
+    for name, entries in temps.items():
+        name_l = (name or "").lower()
+        for entry in entries:
+            label = str(getattr(entry, "label", "") or "").lower()
+            current = getattr(entry, "current", None)
+            if current is None:
+                continue
+            if any(key in name_l for key in ("coretemp", "k10temp", "acpitz", "cpu")) or any(key in label for key in ("package", "cpu", "core")):
+                selected.append(float(current))
+    if not selected:
+        for entries in temps.values():
+            for entry in entries:
+                current = getattr(entry, "current", None)
+                if current is not None:
+                    selected.append(float(current))
+    if not selected:
+        return None, "sensor unavailable"
+    return max(selected), "ok"
+
+def _count_open_files() -> int:
+    if psutil is None:
+        return 0
+    try:
+        proc = psutil.Process()
+        if hasattr(proc, "num_fds"):
+            return int(proc.num_fds())  # type: ignore[attr-defined]
+        if hasattr(proc, "open_files"):
+            return _safe_len(proc.open_files())
+    except Exception:
+        pass
+    return 0
+
+def _count_logged_users() -> List[str]:
+    if psutil is None:
+        return []
+    try:
+        names = [getattr(u, "name", "-") or "-" for u in psutil.users()]
+        return _dedupe_ordered([name for name in names if name])
+    except Exception:
+        return []
+
+def _network_interface_snapshot() -> Dict[str, Any]:
+    data: Dict[str, Any] = {"if_stats": {}, "if_addrs": {}, "pernic": {}}
+    if psutil is None:
+        return data
+    try:
+        data["if_stats"] = psutil.net_if_stats()
+    except Exception:
+        data["if_stats"] = {}
+    try:
+        data["if_addrs"] = psutil.net_if_addrs()
+    except Exception:
+        data["if_addrs"] = {}
+    try:
+        data["pernic"] = psutil.net_io_counters(pernic=True)
+    except Exception:
+        data["pernic"] = {}
+    return data
+
+def _process_snapshot(limit: int = 5) -> Dict[str, Any]:
+    if psutil is None:
+        return {"running": 0, "zombie": 0, "top_cpu": ["psutil belum terpasang"], "top_mem": ["psutil belum terpasang"]}
+    running = 0
+    zombie = 0
+    rows_cpu: List[Tuple[float, int, str, str]] = []
+    rows_mem: List[Tuple[int, int, str, str]] = []
+    try:
+        psutil.cpu_percent(interval=0.05)
+    except Exception:
+        pass
+    try:
+        for proc in psutil.process_iter(attrs=["pid", "name", "username", "memory_info", "status"]):
+            try:
+                info = proc.info
+                pid = _safe_int(info.get("pid"))
+                name = str(info.get("name") or "?")
+                user = str(info.get("username") or "-")
+                status = str(info.get("status") or "").lower()
+                running += 1
+                if status == "zombie":
+                    zombie += 1
+                cpu = float(proc.cpu_percent(interval=0.0))
+                mem = info.get("memory_info")
+                rss = int(getattr(mem, "rss", 0) or 0)
+                rows_cpu.append((cpu, pid, name, user))
+                rows_mem.append((rss, pid, name, user))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    rows_cpu.sort(reverse=True, key=lambda x: x[0])
+    rows_mem.sort(reverse=True, key=lambda x: x[0])
+    top_cpu = [f"• {name} (PID {pid}) — {_fmt_pct(cpu)} — {user}" for cpu, pid, name, user in rows_cpu[:limit]]
+    top_mem = [f"• {name} (PID {pid}) — {_fmt_bytes(rss)} — {user}" for rss, pid, name, user in rows_mem[:limit]]
+    return {"running": running, "zombie": zombie, "top_cpu": top_cpu or ["-"], "top_mem": top_mem or ["-"]}
 
 
 def _get_public_ip() -> str:
@@ -467,7 +1009,12 @@ def _fail2ban_snapshot() -> Dict[str, Any]:
     }
 
 
+
 def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
+    watcher = MONITOR_WATCHER_THREADS.get("server-monitor-fail2ban")
+    if watcher is not None and watcher.is_alive():
+        return
+
     prev_f2b = prev.get("fail2ban") or {}
     cur_f2b = cur.get("fail2ban") or {}
 
@@ -487,10 +1034,8 @@ def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
 
     for jail, cur_detail in cur_details.items():
         prev_detail = prev_details.get(jail, {})
-
         prev_ips = set(prev_detail.get("banned_ips") or [])
         cur_ips = set(cur_detail.get("banned_ips") or [])
-
         new_ips = sorted(cur_ips - prev_ips)
         removed_ips = sorted(prev_ips - cur_ips)
 
@@ -529,6 +1074,7 @@ def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
                 cooldown=180,
             )
 
+
 def _network_online() -> str:
     try:
         socket.create_connection(("1.1.1.1", 53), timeout=2).close()
@@ -537,13 +1083,24 @@ def _network_online() -> str:
         return "offline"
 
 
+
 def _collect_core_snapshot() -> Dict[str, Any]:
     boot_time = time.time()
-    cpu = None
-    mem = None
-    swap = None
-    disk = None
-    net_io = None
+    cpu_percent = None
+    per_cpu: List[float] = []
+    cpu_temp, cpu_temp_status = _cpu_temperature_snapshot()
+    mem = swap = disk = net_io = disk_io = None
+    net_pernic = {}
+    net_stats = {}
+    running_processes = 0
+    zombie_processes = 0
+    top_cpu: List[str] = []
+    top_mem: List[str] = []
+    open_files = 0
+    logged_users: List[str] = []
+    iface_snapshot = _network_interface_snapshot()
+    net_pernic = iface_snapshot.get("pernic") or {}
+    net_stats = iface_snapshot.get("if_stats") or {}
 
     if psutil is not None:
         try:
@@ -551,9 +1108,13 @@ def _collect_core_snapshot() -> Dict[str, Any]:
         except Exception:
             pass
         try:
-            cpu = float(psutil.cpu_percent(interval=0.4))
+            cpu_percent = float(psutil.cpu_percent(interval=0.25))
         except Exception:
-            cpu = None
+            cpu_percent = None
+        try:
+            per_cpu = [float(x) for x in psutil.cpu_percent(interval=0.0, percpu=True)]
+        except Exception:
+            per_cpu = []
         try:
             mem = psutil.virtual_memory()
         except Exception:
@@ -570,41 +1131,82 @@ def _collect_core_snapshot() -> Dict[str, Any]:
             net_io = psutil.net_io_counters()
         except Exception:
             net_io = None
+        try:
+            disk_io = psutil.disk_io_counters()
+        except Exception:
+            disk_io = None
+        proc_stats = _process_snapshot()
+        running_processes = _safe_int(proc_stats.get("running"))
+        zombie_processes = _safe_int(proc_stats.get("zombie"))
+        top_cpu = proc_stats.get("top_cpu") or []
+        top_mem = proc_stats.get("top_mem") or []
+        open_files = _count_open_files()
+        logged_users = _count_logged_users()
     else:
         try:
-            cpu = float(os.getloadavg()[0]) * 100.0
+            cpu_percent = float(os.getloadavg()[0]) * 100.0
         except Exception:
-            cpu = None
+            cpu_percent = None
 
     services = _collect_service_states()
     fail2ban = _fail2ban_snapshot()
     public_ip = _get_public_ip()
     private_ips = _get_private_ips()
+    geo = _lookup_geoip(public_ip)
+    firewall_state = _ufw_status()
+
+    dns_ok = True
+    try:
+        socket.gethostbyname(MONITOR_DNS_TEST_NAME)
+    except Exception:
+        dns_ok = False
+
+    internet_ok = _network_online() == "online"
 
     return {
         "time": datetime.now().astimezone(),
         "hostname": socket.gethostname(),
         "platform": sys.platform,
-        "platform_full": os.uname().sysname + " " + os.uname().release if hasattr(os, "uname") else sys.platform,
+        "platform_full": os.uname().sysname + " " + os.uname().release if hasattr(os, "uname") else platform.platform(),
+        "kernel": os.uname().release if hasattr(os, "uname") else platform.release(),
+        "os_release": platform.platform(),
         "python": sys.version.split()[0],
+        "version": "2.0",
         "boot_time": boot_time,
         "uptime_seconds": int(max(0, time.time() - boot_time)),
-        "cpu": cpu,
+        "cpu": cpu_percent,
+        "cpu_per_core": per_cpu,
+        "cpu_temp": cpu_temp,
+        "cpu_temp_status": cpu_temp_status,
         "mem": mem,
         "swap": swap,
         "disk": disk,
         "loadavg": _load_average(),
         "net_io": net_io,
+        "disk_io": disk_io,
+        "net_pernic": net_pernic,
+        "net_stats": net_stats,
         "public_ip": public_ip,
+        "public_geo": geo,
         "private_ips": private_ips,
         "services": services,
         "fail2ban": fail2ban,
-        "firewall": _ufw_status(),
-        "ssh_last_login": _get_last_login(),
-        "ssh_failed_login": _get_last_failed_ssh(),
+        "firewall": firewall_state,
+        "firewall_hash": _hash_text(firewall_state),
+        "ssh_last_login": MONITOR_SSH_STATS.get("last_success") or _get_last_login(),
+        "ssh_failed_login": MONITOR_SSH_STATS.get("last_failure") or _get_last_failed_ssh(),
+        "ssh_last_disconnect": MONITOR_SSH_STATS.get("last_disconnect") or "-",
         "network_state": _network_online(),
-        "users": [u.name for u in (psutil.users() if psutil is not None else [])] if psutil is not None else [],
+        "dns_ok": dns_ok,
+        "internet_ok": internet_ok,
+        "users": logged_users,
+        "running_processes": running_processes,
+        "zombie_processes": zombie_processes,
+        "open_files": open_files,
+        "top_cpu": top_cpu,
+        "top_mem": top_mem,
     }
+
 
 
 def _collect_resource_snapshot() -> Dict[str, Any]:
@@ -612,6 +1214,7 @@ def _collect_resource_snapshot() -> Dict[str, Any]:
         return {
             "cpu_percent": "-",
             "per_cpu": [],
+            "cpu_temp": None,
             "mem": None,
             "swap": None,
             "disk_root": None,
@@ -620,15 +1223,21 @@ def _collect_resource_snapshot() -> Dict[str, Any]:
             "top_mem": ["psutil belum terpasang"],
             "net_io": None,
             "disk_io": None,
+            "running_processes": 0,
+            "zombie_processes": 0,
+            "open_files": 0,
+            "logged_users": [],
+            "net_rates": {},
+            "disk_io_rates": {},
         }
 
     try:
-        cpu_percent = float(psutil.cpu_percent(interval=0.3))
+        cpu_percent = float(psutil.cpu_percent(interval=0.2))
     except Exception:
         cpu_percent = 0.0
 
     try:
-        per_cpu = psutil.cpu_percent(interval=0.0, percpu=True)
+        per_cpu = [float(x) for x in psutil.cpu_percent(interval=0.0, percpu=True)]
     except Exception:
         per_cpu = []
 
@@ -657,17 +1266,67 @@ def _collect_resource_snapshot() -> Dict[str, Any]:
     except Exception:
         disk_io = None
 
+    temp, _ = _cpu_temperature_snapshot()
+    proc_stats = _process_snapshot()
+    running_processes = _safe_int(proc_stats.get("running"))
+    zombie_processes = _safe_int(proc_stats.get("zombie"))
+    top_cpu = proc_stats.get("top_cpu") or ["-"]
+    top_mem = proc_stats.get("top_mem") or ["-"]
+    open_files = _count_open_files()
+    logged_users = _count_logged_users()
+
+    now = time.time()
+    prev = MONITOR_NET_BASELINE.get("resource") or {}
+    net_rates: Dict[str, Any] = {}
+    disk_io_rates: Dict[str, Any] = {}
+
+    if net_io is not None:
+        prev_net = prev.get("net_io")
+        prev_ts = float(prev.get("ts") or now)
+        dt = max(0.001, now - prev_ts)
+        if prev_net is not None:
+            net_rates = {
+                "rx": max(0.0, (net_io.bytes_recv - getattr(prev_net, "bytes_recv", 0)) / dt),
+                "tx": max(0.0, (net_io.bytes_sent - getattr(prev_net, "bytes_sent", 0)) / dt),
+                "pkt_rx": max(0.0, (net_io.packets_recv - getattr(prev_net, "packets_recv", 0)) / dt),
+                "pkt_tx": max(0.0, (net_io.packets_sent - getattr(prev_net, "packets_sent", 0)) / dt),
+                "err_rx": max(0.0, (net_io.errin - getattr(prev_net, "errin", 0)) / dt),
+                "err_tx": max(0.0, (net_io.errout - getattr(prev_net, "errout", 0)) / dt),
+                "drop_rx": max(0.0, (net_io.dropin - getattr(prev_net, "dropin", 0)) / dt),
+                "drop_tx": max(0.0, (net_io.dropout - getattr(prev_net, "dropout", 0)) / dt),
+            }
+
+    if disk_io is not None:
+        prev_disk_io = prev.get("disk_io")
+        prev_ts = float(prev.get("ts") or now)
+        dt = max(0.001, now - prev_ts)
+        if prev_disk_io is not None:
+            disk_io_rates = {
+                "read": max(0.0, (disk_io.read_bytes - getattr(prev_disk_io, "read_bytes", 0)) / dt),
+                "write": max(0.0, (disk_io.write_bytes - getattr(prev_disk_io, "write_bytes", 0)) / dt),
+                "busy": max(0.0, (getattr(disk_io, "busy_time", 0) - getattr(prev_disk_io, "busy_time", 0)) / dt),
+            }
+
+    MONITOR_NET_BASELINE["resource"] = {"ts": now, "net_io": net_io, "disk_io": disk_io}
+
     return {
         "cpu_percent": cpu_percent,
         "per_cpu": per_cpu,
+        "cpu_temp": temp,
         "mem": mem,
         "swap": swap,
         "disk_root": disk_root,
         "loadavg": _load_average(),
-        "top_cpu": _top_processes_by_cpu(),
-        "top_mem": _top_processes_by_memory(),
+        "top_cpu": top_cpu,
+        "top_mem": top_mem,
         "net_io": net_io,
         "disk_io": disk_io,
+        "running_processes": running_processes,
+        "zombie_processes": zombie_processes,
+        "open_files": open_files,
+        "logged_users": logged_users,
+        "net_rates": net_rates,
+        "disk_io_rates": disk_io_rates,
     }
 
 
@@ -723,6 +1382,7 @@ def _service_block(services: Dict[str, Dict[str, Any]]) -> str:
     return "\n".join(lines) if lines else "-"
 
 
+
 def _dashboard_text(snapshot: Dict[str, Any]) -> str:
     cpu = snapshot.get("cpu")
     mem = snapshot.get("mem")
@@ -735,14 +1395,21 @@ def _dashboard_text(snapshot: Dict[str, Any]) -> str:
     boot_at = _format_boot_time(snapshot.get("boot_time"))
     loadavg = snapshot.get("loadavg") or "-"
     network_state = snapshot.get("network_state") or "unknown"
+    geo = snapshot.get("public_geo") or {}
+    cpu_temp = snapshot.get("cpu_temp")
+    proc_total = snapshot.get("running_processes") or 0
+    zombie_total = snapshot.get("zombie_processes") or 0
+    open_files = snapshot.get("open_files") or 0
+    users = ", ".join(snapshot.get("users") or ["-"])
 
     mem_text = f"{_fmt_pct(mem.percent)} ({_fmt_bytes(mem.used)}/{_fmt_bytes(mem.total)})" if mem else "-"
     swap_text = f"{_fmt_pct(swap.percent)} ({_fmt_bytes(swap.used)}/{_fmt_bytes(swap.total)})" if swap else "-"
     disk_text = f"{_fmt_pct(disk.percent)} ({_fmt_bytes(disk.used)}/{_fmt_bytes(disk.total)})" if disk else "-"
     cpu_text = _fmt_pct(cpu) if cpu is not None else "-"
+    temp_text = f"{_safe_float(cpu_temp):.1f}°C" if cpu_temp is not None else "sensor unavailable"
 
     svc_lines = []
-    for svc in MONITOR_SERVICES[:5]:
+    for svc in MONITOR_SERVICES[:6]:
         item = services.get(svc, {})
         svc_lines.append(f"{_service_emoji(str(item.get('status') or 'unknown'))} {svc}")
 
@@ -751,26 +1418,36 @@ def _dashboard_text(snapshot: Dict[str, Any]) -> str:
         f"🟢 <b>Status VPS</b>\n"
         f"Hostname: <b>{_escape(snapshot.get('hostname') or '-')}</b>\n"
         f"OS: <b>{_escape(snapshot.get('platform_full') or '-')}</b>\n"
+        f"Kernel: <b>{_escape(snapshot.get('kernel') or '-')}</b>\n"
         f"Python: <b>{_escape(snapshot.get('python') or '-')}</b>\n"
+        f"Version: <b>{_escape(snapshot.get('version') or '-')}</b>\n"
         f"Boot: <b>{_escape(boot_at)}</b>\n"
         f"Uptime: <b>{_escape(uptime)}</b>\n"
         f"Network: <b>{_escape(network_state.upper())}</b>\n"
         f"Public IP: <code>{_escape(public_ip)}</code>\n"
-        f"Private IP: <code>{_escape(private_ips)}</code>\n\n"
+        f"Private IP: <code>{_escape(private_ips)}</code>\n"
+        f"Geo: <b>{_escape(geo.get('country') or '-')}</b> {geo.get('flag', '🏳️')} / <b>{_escape(geo.get('city') or '-')}</b>\n"
+        f"ISP: <b>{_escape(geo.get('isp') or '-')}</b>\n"
+        f"ASN: <b>{_escape(geo.get('asn') or '-')}</b>\n\n"
         f"📈 <b>Ringkasan Resource</b>\n"
         f"CPU: <b>{_escape(cpu_text)}</b>\n"
+        f"CPU Temp: <b>{_escape(temp_text)}</b>\n"
         f"RAM: <b>{_escape(mem_text)}</b>\n"
         f"Swap: <b>{_escape(swap_text)}</b>\n"
         f"Disk: <b>{_escape(disk_text)}</b>\n"
-        f"Load Average: <b>{_escape(str(loadavg))}</b>\n\n"
+        f"Load Average: <b>{_escape(str(loadavg))}</b>\n"
+        f"Process: <b>{_escape(str(proc_total))}</b> | Zombie: <b>{_escape(str(zombie_total))}</b> | Open Files: <b>{_escape(str(open_files))}</b>\n"
+        f"Logged Users: <code>{_escape(users)}</code>\n\n"
         f"⚙️ <b>Services</b>\n"
         + ("\n".join(svc_lines) if svc_lines else "-")
     )
 
 
+
 def _resource_text(snapshot: Dict[str, Any]) -> str:
     cpu_percent = snapshot.get("cpu_percent")
     per_cpu = snapshot.get("per_cpu") or []
+    cpu_temp = snapshot.get("cpu_temp")
     mem = snapshot.get("mem")
     swap = snapshot.get("swap")
     disk = snapshot.get("disk_root")
@@ -779,8 +1456,15 @@ def _resource_text(snapshot: Dict[str, Any]) -> str:
     disk_io = snapshot.get("disk_io")
     top_cpu = snapshot.get("top_cpu") or ["-"]
     top_mem = snapshot.get("top_mem") or ["-"]
+    running = snapshot.get("running_processes") or 0
+    zombie = snapshot.get("zombie_processes") or 0
+    open_files = snapshot.get("open_files") or 0
+    users = ", ".join(snapshot.get("logged_users") or ["-"])
+    net_rates = snapshot.get("net_rates") or {}
+    disk_io_rates = snapshot.get("disk_io_rates") or {}
 
     per_cpu_text = ", ".join(_fmt_pct(x) for x in per_cpu[:16]) if per_cpu else "-"
+    temp_text = f"{_safe_float(cpu_temp):.1f}°C" if cpu_temp is not None else "sensor unavailable"
 
     net_text = "-"
     if net_io:
@@ -790,10 +1474,16 @@ def _resource_text(snapshot: Dict[str, Any]) -> str:
     if disk_io:
         disk_io_text = f"Read {_fmt_bytes(disk_io.read_bytes)} / Write {_fmt_bytes(disk_io.write_bytes)}"
 
+    rx_rate = _fmt_rate(net_rates.get("rx"))
+    tx_rate = _fmt_rate(net_rates.get("tx"))
+    read_rate = _fmt_rate(disk_io_rates.get("read"))
+    write_rate = _fmt_rate(disk_io_rates.get("write"))
+
     return (
         "💻 <b>Resource</b>\n\n"
         f"CPU Total: <b>{_escape(_fmt_pct(cpu_percent))}</b>\n"
         f"Per Core: <code>{_escape(per_cpu_text)}</code>\n"
+        f"CPU Temp: <b>{_escape(temp_text)}</b>\n"
         f"RAM: <b>{_escape(_fmt_pct(getattr(mem, 'percent', '-')))}</b> "
         f"(<code>{_escape(_fmt_bytes(getattr(mem, 'used', '-')))} / {_escape(_fmt_bytes(getattr(mem, 'total', '-')))}</code>)\n"
         f"Swap: <b>{_escape(_fmt_pct(getattr(swap, 'percent', '-')))}</b> "
@@ -802,7 +1492,11 @@ def _resource_text(snapshot: Dict[str, Any]) -> str:
         f"(<code>{_escape(_fmt_bytes(getattr(disk, 'used', '-')))} / {_escape(_fmt_bytes(getattr(disk, 'total', '-')))}</code>)\n"
         f"Load Average: <b>{_escape(str(loadavg))}</b>\n"
         f"Network: <b>{_escape(net_text)}</b>\n"
-        f"Disk I/O: <b>{_escape(disk_io_text)}</b>\n\n"
+        f"Bandwidth: <b>RX {_escape(rx_rate)} / TX {_escape(tx_rate)}</b>\n"
+        f"Disk I/O: <b>{_escape(disk_io_text)}</b>\n"
+        f"Disk I/O Rate: <b>Read {_escape(read_rate)} / Write {_escape(write_rate)}</b>\n"
+        f"Process: <b>{_escape(str(running))}</b> | Zombie: <b>{_escape(str(zombie))}</b> | Open Files: <b>{_escape(str(open_files))}</b>\n"
+        f"Users: <code>{_escape(users)}</code>\n\n"
         "🔝 <b>Top CPU</b>\n"
         + "\n".join(top_cpu[:5])
         + "\n\n🔝 <b>Top RAM</b>\n"
@@ -829,13 +1523,18 @@ def _services_text(snapshot: Dict[str, Any]) -> str:
     return "⚙️ <b>Services</b>\n\n" + "\n\n".join(lines)
 
 
+
 def _security_text(snapshot: Dict[str, Any]) -> str:
     f2b = snapshot.get("fail2ban") or {}
     firewall = snapshot.get("firewall") or "-"
     ssh_last = snapshot.get("ssh_last_login") or "-"
     ssh_failed = snapshot.get("ssh_failed_login") or "-"
+    ssh_disc = snapshot.get("ssh_last_disconnect") or "-"
     users = snapshot.get("users") or []
     users_text = ", ".join(users) if users else "-"
+    public_geo = snapshot.get("public_geo") or {}
+    total_ban = _safe_int(f2b.get("banned_total"), 0)
+    fail_count = len([x for x in MONITOR_SSH_STATS["failed"] if time.time() - x[0] <= 60])
 
     if not f2b.get("installed"):
         f2b_text = "Fail2Ban: tidak terpasang"
@@ -843,17 +1542,22 @@ def _security_text(snapshot: Dict[str, Any]) -> str:
         f2b_text = (
             f"Fail2Ban: <b>{_escape(str(f2b.get('status') or 'unknown'))}</b>\n"
             f"Jail: <b>{_escape(', '.join(f2b.get('jails') or ['-']))}</b>\n"
-            f"IP terblokir: <b>{_escape(str(f2b.get('banned_total', 0)))}</b>"
+            f"IP terblokir: <b>{_escape(str(total_ban))}</b>"
         )
 
     return (
         "🛡️ <b>Security</b>\n\n"
         f"{f2b_text}\n\n"
         f"Firewall: <b>{_escape(firewall)}</b>\n"
+        f"Public Geo: <b>{_escape(public_geo.get('country') or '-')}</b> {public_geo.get('flag', '🏳️')} / <b>{_escape(public_geo.get('city') or '-')}</b>\n"
+        f"Public ASN: <b>{_escape(public_geo.get('asn') or '-')}</b>\n"
         f"SSH Login Terakhir: <code>{_escape(_truncate(ssh_last, 280))}</code>\n"
         f"SSH Failed Terakhir: <code>{_escape(_truncate(ssh_failed, 280))}</code>\n"
+        f"SSH Disconnect Terakhir: <code>{_escape(_truncate(ssh_disc, 280))}</code>\n"
+        f"Failed 60s: <b>{_escape(str(fail_count))}</b>\n"
         f"User Login Aktif: <code>{_escape(users_text)}</code>"
     )
+
 
 
 def _network_text(snapshot: Dict[str, Any]) -> str:
@@ -861,25 +1565,37 @@ def _network_text(snapshot: Dict[str, Any]) -> str:
     private_ips = ", ".join(snapshot.get("private_ips") or ["-"])
     network_state = snapshot.get("network_state") or "unknown"
     net_io = snapshot.get("net_io")
+    net_rates = snapshot.get("net_rates") or {}
+    dns_ok = "OK" if snapshot.get("dns_ok") else "Gagal"
+    internet_ok = "ONLINE" if snapshot.get("internet_ok") else "OFFLINE"
+    public_geo = snapshot.get("public_geo") or {}
+    iface_stats = snapshot.get("net_stats") or {}
 
     rx = _fmt_bytes(getattr(net_io, "bytes_recv", "-"))
     tx = _fmt_bytes(getattr(net_io, "bytes_sent", "-"))
 
-    dns_ok = "OK"
-    try:
-        socket.gethostbyname("google.com")
-    except Exception:
-        dns_ok = "Gagal"
+    iface_lines = []
+    for name, st in list(iface_stats.items())[:6]:
+        iface_lines.append(f"• <b>{_escape(name)}</b> — {'UP' if getattr(st, 'isup', False) else 'DOWN'}")
+    iface_text = "\n".join(iface_lines) if iface_lines else "-"
 
     return (
         "🌐 <b>Network</b>\n\n"
         f"Public IP: <code>{_escape(public_ip)}</code>\n"
         f"Private IP: <code>{_escape(private_ips)}</code>\n"
-        f"Status Internet: <b>{_escape(network_state.upper())}</b>\n"
+        f"Status Internet: <b>{_escape(network_state.upper())}</b> / <b>{_escape(internet_ok)}</b>\n"
         f"DNS: <b>{_escape(dns_ok)}</b>\n"
+        f"Geo: <b>{_escape(public_geo.get('country') or '-')}</b> {public_geo.get('flag', '🏳️')} / <b>{_escape(public_geo.get('city') or '-')}</b>\n"
+        f"ISP: <b>{_escape(public_geo.get('isp') or '-')}</b>\n"
+        f"ASN: <b>{_escape(public_geo.get('asn') or '-')}</b>\n"
         f"RX Total: <b>{_escape(rx)}</b>\n"
-        f"TX Total: <b>{_escape(tx)}</b>"
+        f"TX Total: <b>{_escape(tx)}</b>\n"
+        f"RX Rate: <b>{_escape(_fmt_rate(net_rates.get('rx')))}</b>\n"
+        f"TX Rate: <b>{_escape(_fmt_rate(net_rates.get('tx')))}</b>\n\n"
+        "<b>Interfaces</b>\n"
+        f"{iface_text}"
     )
+
 
 
 def _storage_text(rows: List[Dict[str, Any]]) -> str:
@@ -915,6 +1631,7 @@ def _logs_text(snapshot: Dict[str, Any]) -> str:
     )
 
 
+
 def _alerts_text() -> str:
     channel = _get_channel_id()
     channel_text = "-" if channel is None else str(channel)
@@ -925,8 +1642,13 @@ def _alerts_text() -> str:
         f"CPU > <b>{MONITOR_CONFIG['cpu_threshold']}%</b>\n"
         f"RAM > <b>{MONITOR_CONFIG['ram_threshold']}%</b>\n"
         f"Disk > <b>{MONITOR_CONFIG['disk_threshold']}%</b>\n"
-        f"Interval: <b>{MONITOR_CONFIG['interval']}s</b>"
+        f"CPU Temp > <b>{os.getenv('MONITOR_CPU_TEMP_THRESHOLD', '85')}°C</b>\n"
+        f"Bandwidth Spike > <b>{_fmt_rate(MONITOR_BW_SPIKE_BPS)}</b>\n"
+        f"I/O High > <b>{_fmt_rate(MONITOR_IO_HIGH_BPS)}</b>\n"
+        f"Interval: <b>{MONITOR_CONFIG['interval']}s</b>\n"
+        f"Anti-spam cooldown aktif."
     )
+
 
 
 def _settings_text() -> str:
@@ -941,7 +1663,10 @@ def _settings_text() -> str:
         f"Service dipantau: <code>{_escape(services_text)}</code>\n\n"
         f"CPU threshold: <b>{MONITOR_CONFIG['cpu_threshold']}%</b>\n"
         f"RAM threshold: <b>{MONITOR_CONFIG['ram_threshold']}%</b>\n"
-        f"Disk threshold: <b>{MONITOR_CONFIG['disk_threshold']}%</b>"
+        f"Disk threshold: <b>{MONITOR_CONFIG['disk_threshold']}%</b>\n"
+        f"CPU temp threshold: <b>{os.getenv('MONITOR_CPU_TEMP_THRESHOLD', '85')}°C</b>\n"
+        f"Bandwidth spike: <b>{_fmt_rate(MONITOR_BW_SPIKE_BPS)}</b>\n"
+        f"I/O high: <b>{_fmt_rate(MONITOR_IO_HIGH_BPS)}</b>"
     )
 
 
@@ -1286,6 +2011,36 @@ def _reset_defaults():
     )
 
 
+
+def _metric_state(key: str) -> Dict[str, Any]:
+    state = MONITOR_ALERT_STATE.get(key)
+    if state is None:
+        state = {"active": False, "last_alert": 0.0, "last_recovery": 0.0, "value": None}
+        MONITOR_ALERT_STATE[key] = state
+    return state
+
+def _raise_metric(bot, key: str, title: str, body: str, icon: str, cooldown: int = 600) -> bool:
+    state = _metric_state(key)
+    now = time.time()
+    if state.get("active") and now - float(state.get("last_alert") or 0.0) < cooldown:
+        return False
+    state["active"] = True
+    state["last_alert"] = now
+    state["value"] = body
+    return _alert(bot, title, body, icon=icon, cooldown_key=key, cooldown=cooldown)
+
+def _recover_metric(bot, key: str, title: str, body: str, icon: str = "🟢", cooldown: int = 300) -> bool:
+    state = _metric_state(key)
+    if not state.get("active"):
+        return False
+    now = time.time()
+    if now - float(state.get("last_recovery") or 0.0) < cooldown:
+        return False
+    state["active"] = False
+    state["last_recovery"] = now
+    return _alert(bot, title, body, icon=icon, cooldown_key=f"{key}:recovery", cooldown=cooldown)
+
+
 def _can_alert(key: str, cooldown: int = 600) -> bool:
     now = time.time()
     last = MONITOR_ALERT_LAST_AT.get(key, 0.0)
@@ -1304,16 +2059,18 @@ def _alert(bot, title: str, body: str, icon: str = "⚠️", cooldown_key: Optio
     return _send_channel_log(bot, text)
 
 
+
 def _evaluate_monitor_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
     if not MONITOR_CONFIG.get("enabled"):
         return
 
+    # Boot / IP / firewall changes
     prev_boot = prev.get("boot_time")
     cur_boot = cur.get("boot_time")
     if prev_boot and cur_boot and float(prev_boot) != float(cur_boot):
         _alert(
             bot,
-            "VPS Reboot",
+            "Server Reboot",
             f"Boot time berubah.\nLama: <code>{_escape(_format_boot_time(prev_boot))}</code>\nBaru: <code>{_escape(_format_boot_time(cur_boot))}</code>",
             icon="🔄",
             cooldown_key="reboot",
@@ -1325,124 +2082,564 @@ def _evaluate_monitor_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
     if prev_ip != cur_ip and cur_ip != "-":
         _alert(
             bot,
-            "Public IP Berubah",
+            "Public IP Changed",
             f"Lama: <code>{_escape(prev_ip)}</code>\nBaru: <code>{_escape(cur_ip)}</code>",
             icon="🌐",
             cooldown_key="public_ip_change",
             cooldown=300,
         )
 
-    prev_cpu = float(prev.get("cpu") or 0.0)
-    cur_cpu = float(cur.get("cpu") or 0.0)
-    if cur_cpu >= MONITOR_CONFIG["cpu_threshold"] and (prev_cpu < MONITOR_CONFIG["cpu_threshold"] or _can_alert("cpu_high", cooldown=600)):
+    prev_fw = str(prev.get("firewall_hash") or "")
+    cur_fw = str(cur.get("firewall_hash") or "")
+    if prev_fw and cur_fw and prev_fw != cur_fw:
         _alert(
             bot,
-            "CPU Tinggi",
-            f"CPU: <b>{_fmt_pct(cur_cpu)}</b>\nThreshold: <b>{MONITOR_CONFIG['cpu_threshold']}%</b>",
-            icon="🚨",
-            cooldown_key="cpu_high",
-            cooldown=600,
+            "Firewall Changed",
+            f"Status firewall berubah.\nSebelumnya: <code>{_escape(str(prev.get('firewall') or '-'))}</code>\nSekarang: <code>{_escape(str(cur.get('firewall') or '-'))}</code>",
+            icon="🧱",
+            cooldown_key="firewall_change",
+            cooldown=300,
         )
 
+    # CPU / RAM / Disk / Temperature / I/O
+    cpu = _safe_float(cur.get("cpu"))
+    prev_cpu = _safe_float(prev.get("cpu"))
+    cpu_threshold = _safe_float(MONITOR_CONFIG.get("cpu_threshold"), 90.0)
+    if cpu >= cpu_threshold:
+        _raise_metric(
+            bot,
+            "cpu_high",
+            "CPU Alert",
+            f"CPU: <b>{_fmt_pct(cpu)}</b>\nThreshold: <b>{cpu_threshold:.0f}%</b>",
+            icon="🌡" if cur.get("cpu_temp") else "🚨",
+            cooldown=300,
+        )
+    else:
+        _recover_metric(
+            bot,
+            "cpu_high",
+            "CPU Recovery",
+            f"CPU kembali normal: <b>{_fmt_pct(cpu)}</b>",
+            icon="🟢",
+            cooldown=180,
+        )
+
+    mem = cur.get("mem")
     prev_mem = prev.get("mem")
-    cur_mem = cur.get("mem")
-    prev_mem_pct = float(getattr(prev_mem, "percent", 0.0) or 0.0)
-    cur_mem_pct = float(getattr(cur_mem, "percent", 0.0) or 0.0)
-    if cur_mem_pct >= MONITOR_CONFIG["ram_threshold"] and (prev_mem_pct < MONITOR_CONFIG["ram_threshold"] or _can_alert("ram_high", cooldown=600)):
-        _alert(
+    mem_pct = _safe_float(getattr(mem, "percent", 0.0))
+    mem_threshold = _safe_float(MONITOR_CONFIG.get("ram_threshold"), 90.0)
+    if mem_pct >= mem_threshold:
+        _raise_metric(
             bot,
-            "RAM Tinggi",
-            f"RAM: <b>{_fmt_pct(cur_mem_pct)}</b>\nThreshold: <b>{MONITOR_CONFIG['ram_threshold']}%</b>",
+            "ram_high",
+            "RAM Alert",
+            f"RAM: <b>{_fmt_pct(mem_pct)}</b>\nThreshold: <b>{mem_threshold:.0f}%</b>",
             icon="🧠",
-            cooldown_key="ram_high",
+            cooldown=300,
+        )
+    else:
+        _recover_metric(
+            bot,
+            "ram_high",
+            "RAM Recovery",
+            f"RAM kembali normal: <b>{_fmt_pct(mem_pct)}</b>",
+            icon="🟢",
+            cooldown=180,
+        )
+
+    disk = cur.get("disk")
+    disk_pct = _safe_float(getattr(disk, "percent", 0.0))
+    disk_threshold = _safe_float(MONITOR_CONFIG.get("disk_threshold"), 90.0)
+    if disk_pct >= disk_threshold:
+        _raise_metric(
+            bot,
+            "disk_high",
+            "Disk Alert",
+            f"Disk /: <b>{_fmt_pct(disk_pct)}</b>\nThreshold: <b>{disk_threshold:.0f}%</b>",
+            icon="💾",
+            cooldown=600,
+        )
+    else:
+        _recover_metric(
+            bot,
+            "disk_high",
+            "Disk Recovery",
+            f"Disk kembali normal: <b>{_fmt_pct(disk_pct)}</b>",
+            icon="🟢",
+            cooldown=300,
+        )
+
+    temp = cur.get("cpu_temp")
+    if temp is not None and _safe_float(temp) >= _safe_float(os.getenv("MONITOR_CPU_TEMP_THRESHOLD", "85")):
+        _raise_metric(
+            bot,
+            "cpu_temp_high",
+            "CPU Temperature",
+            f"Suhu CPU: <b>{_safe_float(temp):.1f}°C</b>",
+            icon="🌡",
             cooldown=600,
         )
 
-    prev_disk = prev.get("disk")
-    cur_disk = cur.get("disk")
-    prev_disk_pct = float(getattr(prev_disk, "percent", 0.0) or 0.0)
-    cur_disk_pct = float(getattr(cur_disk, "percent", 0.0) or 0.0)
-    if cur_disk_pct >= MONITOR_CONFIG["disk_threshold"] and (prev_disk_pct < MONITOR_CONFIG["disk_threshold"] or _can_alert("disk_high", cooldown=900)):
-        _alert(
-            bot,
-            "Disk Hampir Penuh",
-            f"Disk /: <b>{_fmt_pct(cur_disk_pct)}</b>\nThreshold: <b>{MONITOR_CONFIG['disk_threshold']}%</b>",
-            icon="💽",
-            cooldown_key="disk_high",
-            cooldown=900,
-        )
-
-    prev_services = prev.get("services") or {}
-    cur_services = cur.get("services") or {}
-    for svc, info in cur_services.items():
-        prev_state = str((prev_services.get(svc) or {}).get("status") or "unknown").lower()
-        cur_state = str(info.get("status") or "unknown").lower()
-        if prev_state != cur_state:
-            icon = "🟢" if cur_state == "active" else "🔴"
-            title = "Service Aktif" if cur_state == "active" else "Service Mati"
-            body = (
-                f"Service: <b>{_escape(svc)}</b>\n"
-                f"Dari: <b>{_escape(prev_state)}</b>\n"
-                f"Ke: <b>{_escape(cur_state)}</b>"
-            )
-            _alert(bot, title, body, icon=icon, cooldown_key=f"service_{svc}", cooldown=120)
-
-    prev_f2b = prev.get("fail2ban") or {}
-    cur_f2b = cur.get("fail2ban") or {}
-    if cur_f2b.get("installed"):
-        prev_banned = int(prev_f2b.get("banned_total", 0) or 0)
-        cur_banned = int(cur_f2b.get("banned_total", 0) or 0)
-        if cur_banned > prev_banned:
-            _alert(
+    net_rates = cur.get("net_rates") or {}
+    if net_rates:
+        rx = _safe_float(net_rates.get("rx"))
+        tx = _safe_float(net_rates.get("tx"))
+        if max(rx, tx) >= MONITOR_BW_SPIKE_BPS:
+            _raise_metric(
                 bot,
-                "Fail2Ban Ban",
-                f"IP terblokir bertambah.\nLama: <b>{prev_banned}</b>\nBaru: <b>{cur_banned}</b>",
-                icon="🔒",
-                cooldown_key="fail2ban_ban",
+                "bandwidth_spike",
+                "Bandwidth Spike",
+                f"RX: <b>{_fmt_rate(rx)}</b>\nTX: <b>{_fmt_rate(tx)}</b>\nThreshold: <b>{_fmt_rate(MONITOR_BW_SPIKE_BPS)}</b>",
+                icon="📶",
                 cooldown=300,
             )
 
+    disk_rates = cur.get("disk_io_rates") or {}
+    if disk_rates:
+        read_bps = _safe_float(disk_rates.get("read"))
+        write_bps = _safe_float(disk_rates.get("write"))
+        if max(read_bps, write_bps) >= MONITOR_IO_HIGH_BPS:
+            _raise_metric(
+                bot,
+                "disk_io_high",
+                "I/O Alert",
+                f"Read: <b>{_fmt_rate(read_bps)}</b>\nWrite: <b>{_fmt_rate(write_bps)}</b>",
+                icon="🗃️",
+                cooldown=600,
+            )
+
+    # Network interface state changes and quality
+    prev_stats = prev.get("net_stats") or {}
+    cur_stats = cur.get("net_stats") or {}
+    for iface, stats in cur_stats.items():
+        prev_iface = prev_stats.get(iface)
+        if prev_iface is None:
+            continue
+        prev_up = bool(getattr(prev_iface, "isup", False))
+        cur_up = bool(getattr(stats, "isup", False))
+        if prev_up != cur_up:
+            title = "Interface Up" if cur_up else "Interface Down"
+            icon = "🟢" if cur_up else "🔴"
+            _emit_channel_event(
+                bot,
+                icon,
+                title,
+                f"Interface: <b>{_escape(iface)}</b>\nStatus: <b>{'UP' if cur_up else 'DOWN'}</b>",
+                f"iface:{iface}:{cur_up}",
+                cooldown=120,
+            )
+
+    # Service transitions
+    prev_services = prev.get("services") or {}
+    cur_services = cur.get("services") or {}
+    for svc, cur_item in cur_services.items():
+        prev_item = dict(prev_services.get(svc) or MONITOR_SERVICE_BASELINE.get(svc) or {})
+        _update_service_state_cache(svc, cur_item)
+        _evaluate_service_alert(bot, svc, prev_item, cur_item)
+
+    # Security heuristics
+    failed_events = [x for x in MONITOR_SSH_STATS["failed"] if time.time() - x[0] <= 60]
+    if len(failed_events) >= MONITOR_PORT_SCAN_THRESHOLD:
+        ips = sorted(set(item[1] for item in failed_events if item[1] != "-"))
+        body = (
+            f"Failed SSH attempts: <b>{len(failed_events)}</b> / 60 detik\n"
+            f"Source IP unik: <b>{len(ips)}</b>\n"
+            f"Contoh IP: <code>{_escape(', '.join(ips[:5]) if ips else '-')}</code>"
+        )
+        _emit_channel_event(bot, "🚨", "Port Scan / Brute Force", body, "portscan_bruteforce", cooldown=180)
+
+    # Fail2ban snapshot fallback already handled elsewhere
+
+
+def _emit_channel_event(bot, icon: str, title: str, body: str, cooldown_key: str, cooldown: int = 180) -> None:
+    _alert(bot, title, body, icon=icon, cooldown_key=cooldown_key, cooldown=cooldown)
+
+def _service_state_changed(prev_item: Dict[str, Any], cur_item: Dict[str, Any]) -> bool:
+    keys = ("status", "pid", "result", "exec_status", "exec_code", "n_restarts")
+    return any(str(prev_item.get(k)) != str(cur_item.get(k)) for k in keys)
+
+def _service_downtime_seconds(prev_item: Dict[str, Any], cur_item: Dict[str, Any]) -> int:
+    start = float(prev_item.get("down_since") or 0.0)
+    if not start:
+        start = float(cur_item.get("down_since") or 0.0)
+    if not start:
+        return 0
+    return max(0, int(time.time() - start))
+
+def _update_service_state_cache(service: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    prev = MONITOR_SERVICE_BASELINE.get(service, {})
+    cur = dict(item)
+    prev_state = str(prev.get("status") or "unknown").lower()
+    cur_state = str(cur.get("status") or "unknown").lower()
+    prev_pid = _safe_int(prev.get("main_pid") or prev.get("pid"), 0)
+    cur_pid = _safe_int(cur.get("main_pid") or cur.get("pid"), 0)
+
+    if cur_state in {"inactive", "failed"}:
+        if not prev.get("down_since"):
+            cur["down_since"] = time.time()
+        else:
+            cur["down_since"] = float(prev.get("down_since") or time.time())
+    elif prev.get("down_since"):
+        cur["down_since"] = float(prev.get("down_since") or 0.0)
+
+    if prev and cur_state == "active" and prev_state in {"inactive", "failed"}:
+        cur["recovered_at"] = time.time()
+
+    if prev_pid and cur_pid and prev_pid != cur_pid:
+        cur["pid_changed"] = True
+
+    if _safe_int(prev.get("n_restarts"), 0) != _safe_int(cur.get("n_restarts"), 0):
+        cur["restart_changed"] = True
+
+    MONITOR_SERVICE_BASELINE[service] = cur
+    return prev
+
+def _evaluate_service_alert(bot, service: str, prev_item: Dict[str, Any], cur_item: Dict[str, Any]) -> None:
+    prev_state = str(prev_item.get("status") or "unknown").lower()
+    cur_state = str(cur_item.get("status") or "unknown").lower()
+    cur_pid = _safe_int(cur_item.get("main_pid") or cur_item.get("pid"), 0)
+    prev_pid = _safe_int(prev_item.get("main_pid") or prev_item.get("pid"), 0)
+    restarts_prev = _safe_int(prev_item.get("n_restarts"), 0)
+    restarts_cur = _safe_int(cur_item.get("n_restarts"), 0)
+    result = str(cur_item.get("result") or "-")
+    exec_status = str(cur_item.get("exec_status") or "-")
+    exec_code = str(cur_item.get("exec_code") or "-")
+
+    if cur_state in {"inactive", "failed"} and prev_state == "active":
+        downtime = _service_downtime_seconds(prev_item, cur_item)
+        body = (
+            f"Service: <b>{_escape(service)}</b>\n"
+            f"Status: <b>{_escape(cur_state.upper())}</b>\n"
+            f"PID sebelumnya: <code>{_escape(str(prev_pid or '-'))}</code>\n"
+            f"Exit code: <b>{_escape(exec_code)}</b>\n"
+            f"Exit status: <b>{_escape(exec_status)}</b>\n"
+            f"Result: <b>{_escape(result)}</b>\n"
+            f"Downtime: <b>{_escape(_fmt_duration(downtime))}</b>"
+        )
+        _emit_channel_event(bot, "🔴", "Service Down", body, f"svc_down:{service}", cooldown=120)
+        _metric_state(f"svc:{service}")["active"] = True
+        _metric_state(f"svc:{service}")["down_at"] = time.time()
+
+    if cur_state == "active" and prev_state in {"inactive", "failed"}:
+        recovery = _service_downtime_seconds(prev_item, cur_item)
+        body = (
+            f"Service: <b>{_escape(service)}</b>\n"
+            f"Status: <b>ACTIVE</b>\n"
+            f"Recovery time: <b>{_escape(_fmt_duration(recovery))}</b>\n"
+            f"PID: <code>{_escape(str(cur_pid or '-'))}</code>"
+        )
+        _emit_channel_event(bot, "🟢", "Service Recovery", body, f"svc_recovery:{service}", cooldown=120)
+        _metric_state(f"svc:{service}")["active"] = False
+
+    if cur_state == "failed" and prev_state != "failed":
+        body = (
+            f"Service: <b>{_escape(service)}</b>\n"
+            f"Status: <b>FAILED</b>\n"
+            f"Exit code: <b>{_escape(exec_code)}</b>\n"
+            f"Exit status: <b>{_escape(exec_status)}</b>\n"
+            f"Result: <b>{_escape(result)}</b>"
+        )
+        _emit_channel_event(bot, "❌", "Service Failed", body, f"svc_failed:{service}", cooldown=120)
+
+    if cur_pid and prev_pid and cur_pid != prev_pid and cur_state == "active":
+        body = (
+            f"Service: <b>{_escape(service)}</b>\n"
+            f"PID lama: <code>{_escape(str(prev_pid))}</code>\n"
+            f"PID baru: <code>{_escape(str(cur_pid))}</code>"
+        )
+        _emit_channel_event(bot, "⚙️", "Service Restart", body, f"svc_pid:{service}", cooldown=120)
+
+    if restarts_cur > restarts_prev:
+        body = (
+            f"Service: <b>{_escape(service)}</b>\n"
+            f"NRestarts: <b>{restarts_prev}</b> → <b>{restarts_cur}</b>\n"
+            f"Status: <b>{_escape(cur_state.upper())}</b>"
+        )
+        _emit_channel_event(bot, "⚙️", "Service Restart", body, f"svc_nrestart:{service}", cooldown=120)
+
+    if cur_state == "active" and prev_state == "active" and result not in {"success", "-"}:
+        body = (
+            f"Service: <b>{_escape(service)}</b>\n"
+            f"Result: <b>{_escape(result)}</b>\n"
+            f"Exit code: <b>{_escape(exec_code)}</b>\n"
+            f"Exit status: <b>{_escape(exec_status)}</b>"
+        )
+        _emit_channel_event(bot, "⚠️", "Service Warning", body, f"svc_warn:{service}", cooldown=180)
+
+def _handle_ssh_event(bot, event: Dict[str, Any]) -> None:
+    ip = str(event.get("ip") or "-")
+    user = str(event.get("user") or "-")
+    method = str(event.get("method") or "unknown")
+    kind = str(event.get("kind") or "ssh_other")
+    ts = str(event.get("timestamp") or _now_text())
+    geo = _lookup_geoip(ip)
+
+    if kind == "ssh_success":
+        MONITOR_SSH_STATS["last_success"] = f"{ts} | {user} | {ip} | {method}"
+        MONITOR_SSH_STATS["session_events"].append((time.time(), "success", ip, user))
+        body = (
+            f"User: <b>{_escape(user)}</b>\n"
+            f"IP: <code>{_escape(ip)}</code>\n"
+            f"Negara: <b>{_escape(geo.get('country') or '-')}</b> {geo.get('flag', '🏳️')}\n"
+            f"Kota: <b>{_escape(geo.get('city') or '-')}</b>\n"
+            f"ISP: <b>{_escape(geo.get('isp') or '-')}</b>\n"
+            f"ASN: <b>{_escape(geo.get('asn') or '-')}</b>\n"
+            f"RDNS: <code>{_escape(geo.get('reverse_dns') or '-')}</code>\n"
+            f"Method: <b>{_escape(method)}</b>\n"
+            f"Timestamp: <code>{_escape(ts)}</code>"
+        )
+        _emit_channel_event(bot, "👤", "SSH Login", body, f"ssh_success:{ip}:{user}", cooldown=60)
+        return
+
+    if kind == "ssh_failed":
+        MONITOR_SSH_STATS["last_failure"] = f"{ts} | {user} | {ip} | {method}"
+        MONITOR_SSH_STATS["failed"].append((time.time(), ip, user, method))
+        bucket = _ssh_rate_bucket(ip)
+        bucket.append(time.time())
+        recent = [x for x in bucket if time.time() - x <= 60]
+        body = (
+            f"User: <b>{_escape(user)}</b>\n"
+            f"IP: <code>{_escape(ip)}</code>\n"
+            f"Negara: <b>{_escape(geo.get('country') or '-')}</b> {geo.get('flag', '🏳️')}\n"
+            f"Kota: <b>{_escape(geo.get('city') or '-')}</b>\n"
+            f"ISP: <b>{_escape(geo.get('isp') or '-')}</b>\n"
+            f"ASN: <b>{_escape(geo.get('asn') or '-')}</b>\n"
+            f"Method: <b>{_escape(method)}</b>\n"
+            f"Timestamp: <code>{_escape(ts)}</code>"
+        )
+        _emit_channel_event(bot, "❌", "SSH Failed", body, f"ssh_failed:{ip}:{user}", cooldown=45)
+
+        if len(recent) >= MONITOR_SSH_BRUTE_FORCE_THRESHOLD:
+            brute_body = (
+                f"IP: <code>{_escape(ip)}</code>\n"
+                f"Failed login: <b>{len(recent)}</b> / 60 detik\n"
+                f"User terakhir: <b>{_escape(user)}</b>\n"
+                f"RDNS: <code>{_escape(geo.get('reverse_dns') or '-')}</code>"
+            )
+            _emit_channel_event(bot, "🚨", "Brute Force", brute_body, f"ssh_bruteforce:{ip}", cooldown=180)
+        return
+
+    if kind == "ssh_session_open":
+        MONITOR_SSH_STATS["session_events"].append((time.time(), "open", ip, user))
+        body = (
+            f"User: <b>{_escape(user)}</b>\n"
+            f"IP: <code>{_escape(ip)}</code>\n"
+            f"Method: <b>{_escape(method)}</b>\n"
+            f"Timestamp: <code>{_escape(ts)}</code>"
+        )
+        _emit_channel_event(bot, "🔓", "Session Open", body, f"ssh_open:{ip}:{user}", cooldown=45)
+        return
+
+    if kind == "ssh_session_close":
+        MONITOR_SSH_STATS["session_events"].append((time.time(), "close", ip, user))
+        body = (
+            f"User: <b>{_escape(user)}</b>\n"
+            f"IP: <code>{_escape(ip)}</code>\n"
+            f"Timestamp: <code>{_escape(ts)}</code>"
+        )
+        _emit_channel_event(bot, "🔒", "Session Closed", body, f"ssh_close:{ip}:{user}", cooldown=45)
+        return
+
+    if kind == "ssh_disconnect":
+        MONITOR_SSH_STATS["last_disconnect"] = f"{ts} | {user} | {ip}"
+        body = (
+            f"User: <b>{_escape(user)}</b>\n"
+            f"IP: <code>{_escape(ip)}</code>\n"
+            f"Timestamp: <code>{_escape(ts)}</code>"
+        )
+        _emit_channel_event(bot, "📡", "Disconnect", body, f"ssh_disc:{ip}:{user}", cooldown=45)
+        return
+
+def _handle_fail2ban_event(bot, event: Dict[str, Any]) -> None:
+    ip = str(event.get("ip") or "-")
+    jail = str(event.get("jail") or "-")
+    kind = str(event.get("kind") or "fail2ban_other")
+    ts = str(event.get("timestamp") or _now_text())
+    geo = _lookup_geoip(ip)
+
+    if kind == "fail2ban_failed":
+        MONITOR_FAIL2BAN_STATS["failed_counts"].append((time.time(), jail, ip))
+        return
+
+    if kind == "fail2ban_ban":
+        MONITOR_FAIL2BAN_STATS["total_ban"] = _safe_int(MONITOR_FAIL2BAN_STATS.get("total_ban"), 0) + 1
+        MONITOR_FAIL2BAN_STATS["ban_events"].append((time.time(), jail, ip))
+        body = (
+            f"Jail: <b>{_escape(jail)}</b>\n"
+            f"IP: <code>{_escape(ip)}</code>\n"
+            f"Negara: <b>{_escape(geo.get('country') or '-')}</b> {geo.get('flag', '🏳️')}\n"
+            f"Kota: <b>{_escape(geo.get('city') or '-')}</b>\n"
+            f"ISP: <b>{_escape(geo.get('isp') or '-')}</b>\n"
+            f"ASN: <b>{_escape(geo.get('asn') or '-')}</b>\n"
+            f"RDNS: <code>{_escape(geo.get('reverse_dns') or '-')}</code>\n"
+            f"Timestamp: <code>{_escape(ts)}</code>"
+        )
+        _emit_channel_event(bot, "🔒", "Fail2Ban Ban", body, f"f2b_ban:{jail}:{ip}", cooldown=90)
+        return
+
+    if kind == "fail2ban_unban":
+        MONITOR_FAIL2BAN_STATS["unban_events"].append((time.time(), jail, ip))
+        body = (
+            f"Jail: <b>{_escape(jail)}</b>\n"
+            f"IP: <code>{_escape(ip)}</code>\n"
+            f"Timestamp: <code>{_escape(ts)}</code>"
+        )
+        _emit_channel_event(bot, "🔓", "Fail2Ban Unban", body, f"f2b_unban:{jail}:{ip}", cooldown=90)
+        return
+
+def _ssh_journal_parser(bot, line: str) -> None:
+    event = _parse_ssh_event(line)
+    if event:
+        _handle_ssh_event(bot, event)
+
+def _fail2ban_journal_parser(bot, line: str) -> None:
+    event = _parse_fail2ban_event(line)
+    if event:
+        _handle_fail2ban_event(bot, event)
+
+def _journal_worker_wrapper(bot, name: str, units: Tuple[str, ...], parser_fn) -> None:
+    def _parser(line: str):
+        parser_fn(bot, line)
+    _journal_tail_worker(name, units, _parser)
+
+def _service_loop_body(bot) -> None:
+    global MONITOR_BOOT_NOTICE_SENT, MONITOR_SUPERVISOR_LAST_HEARTBEAT
+    while not MONITOR_WATCHER_STOP.is_set():
+        try:
+            interval = max(15, _safe_int(MONITOR_CONFIG.get("interval"), 60))
+            if not MONITOR_CONFIG.get("enabled"):
+                MONITOR_SUPERVISOR_LAST_HEARTBEAT = time.time()
+                time.sleep(min(interval, 10))
+                continue
+
+            core = _collect_core_snapshot()
+            resource = _collect_resource_snapshot()
+            cur = dict(core)
+            cur.update(resource)
+            prev = MONITOR_LAST_CORE.get("core")
+
+            if not MONITOR_BOOT_NOTICE_SENT and _get_channel_id() is not None:
+                startup_text = _startup_notice_text(cur)
+                _send_channel_log(bot, startup_text)
+                MONITOR_BOOT_NOTICE_SENT = True
+
+            if prev is not None:
+                _evaluate_monitor_alerts(bot, prev, cur)
+                _evaluate_fail2ban_alerts(bot, prev, cur)
+                _evaluate_service_changes(bot, prev, cur)
+
+            MONITOR_LAST_CORE["core"] = cur
+            MONITOR_SUPERVISOR_LAST_HEARTBEAT = time.time()
+            time.sleep(interval)
+        except Exception as exc:
+            report_local_error("service_loop", exc)
+            time.sleep(10)
+
+def _service_watcher_loop(bot) -> None:
+    _journal_worker_wrapper(bot, "ssh", _service_units("ssh"), _ssh_journal_parser)
+
+def _fail2ban_watcher_loop(bot) -> None:
+    _journal_worker_wrapper(bot, "fail2ban", _service_units("fail2ban"), _fail2ban_journal_parser)
+
+def _evaluate_service_changes(bot, prev: Dict[str, Any], cur: Dict[str, Any]) -> None:
+    prev_services = prev.get("services") or {}
+    cur_services = cur.get("services") or {}
+    for svc, cur_item in cur_services.items():
+        prev_item = dict(prev_services.get(svc) or {})
+        prev_baseline = MONITOR_SERVICE_BASELINE.get(svc, prev_item)
+        before = dict(prev_baseline or {})
+        if not before:
+            before = prev_item
+        _update_service_state_cache(svc, cur_item)
+        if before and _service_state_changed(before, cur_item):
+            _evaluate_service_alert(bot, svc, before, cur_item)
+        else:
+            _evaluate_service_alert(bot, svc, before, cur_item)
+
+def _startup_notice_text(snapshot: Dict[str, Any]) -> str:
+    geo = snapshot.get("public_geo") or {}
+    private_ips = ", ".join(snapshot.get("private_ips") or ["-"])
+    cpu = _fmt_pct(snapshot.get("cpu"))
+    mem = snapshot.get("mem")
+    disk = snapshot.get("disk")
+    disk_text = "-"
+    if disk:
+        disk_text = f"{_fmt_pct(disk.percent)} ({_fmt_bytes(disk.used)}/{_fmt_bytes(disk.total)})"
+    mem_text = "-"
+    if mem:
+        mem_text = f"{_fmt_pct(mem.percent)} ({_fmt_bytes(mem.used)}/{_fmt_bytes(mem.total)})"
+    return (
+        "🟢 <b>Server Online</b>\n\n"
+        f"Hostname: <b>{_escape(snapshot.get('hostname') or '-')}</b>\n"
+        f"OS: <b>{_escape(snapshot.get('platform_full') or '-')}</b>\n"
+        f"Kernel: <b>{_escape(snapshot.get('kernel') or '-')}</b>\n"
+        f"Python: <b>{_escape(snapshot.get('python') or '-')}</b>\n"
+        f"Version: <b>{_escape(snapshot.get('version') or '-')}</b>\n"
+        f"CPU: <b>{_escape(cpu)}</b>\n"
+        f"RAM: <b>{_escape(mem_text)}</b>\n"
+        f"Disk: <b>{_escape(disk_text)}</b>\n"
+        f"Public IP: <code>{_escape(snapshot.get('public_ip') or '-')}</code>\n"
+        f"Private IP: <code>{_escape(private_ips)}</code>\n"
+        f"Uptime: <b>{_escape(_fmt_duration(snapshot.get('uptime_seconds')))}</b>\n"
+        f"Boot Time: <b>{_escape(_format_boot_time(snapshot.get('boot_time')))}</b>\n"
+        f"Geo: <b>{_escape(geo.get('country') or '-')}</b> {geo.get('flag', '🏳️')} / <b>{_escape(geo.get('city') or '-')}</b>\n"
+        f"ISP: <b>{_escape(geo.get('isp') or '-')}</b>\n"
+        f"ASN: <b>{_escape(geo.get('asn') or '-')}</b>\n"
+        f"RDNS: <code>{_escape(geo.get('reverse_dns') or '-')}</code>\n"
+        f"Waktu: <code>{_escape(_now_text())}</code>"
+    )
+
+
 
 def _monitor_loop(bot):
-    logger.info("Server monitor loop started")
-    while True:
-        try:
-            interval = int(MONITOR_CONFIG.get("interval") or 60)
-            interval = max(15, interval)
+    _service_loop_body(bot)
 
-            if MONITOR_CONFIG.get("enabled"):
-                cur = _collect_core_snapshot()
-                prev = MONITOR_LAST_CORE.get("core")
-
-                # send startup notice once if channel configured
-                if prev is None and _get_channel_id() is not None:
-                    _send_channel_log(
-                        bot,
-                        "🟢 <b>Monitor Server Aktif</b>\n\n"
-                        f"Service: <b>{_escape(MAIN_SERVICE_NAME)}</b>\n"
-                        f"Host: <b>{_escape(cur.get('hostname') or '-')}</b>\n"
-                        f"Waktu: <code>{_escape(_now_text())}</code>",
-                    )
-
-                if prev is not None:
-                    _evaluate_monitor_alerts(bot, prev, cur)
-                    _evaluate_fail2ban_alerts(bot, prev, cur)
-
-                MONITOR_LAST_CORE["core"] = cur
-
-            time.sleep(interval)
-        except Exception:
-            report_local_error("monitor_loop", sys.exc_info()[1] if sys.exc_info()[1] else Exception("monitor loop error"))
-            time.sleep(max(15, int(MONITOR_CONFIG.get("interval") or 60)))
 
 
 def _ensure_monitor_thread(bot):
-    global MONITOR_THREAD_STARTED
+    global MONITOR_THREAD_STARTED, MONITOR_SUPERVISOR_STARTED
     if MONITOR_THREAD_STARTED:
         return
     MONITOR_THREAD_STARTED = True
-    thread = threading.Thread(target=_monitor_loop, args=(bot,), daemon=True, name="server-monitor-loop")
-    thread.start()
+    MONITOR_WATCHER_STOP.clear()
+
+    def _spawn(name: str, target):
+        thread = threading.Thread(target=target, args=(bot,), daemon=True, name=name)
+        MONITOR_WATCHER_THREADS[name] = thread
+        thread.start()
+        return thread
+
+    _spawn("server-monitor-loop", _monitor_loop)
+    _spawn("server-monitor-ssh", _service_watcher_loop)
+    _spawn("server-monitor-fail2ban", _fail2ban_watcher_loop)
+
+    if not MONITOR_SUPERVISOR_STARTED:
+        MONITOR_SUPERVISOR_STARTED = True
+
+        def _supervisor():
+            while not MONITOR_WATCHER_STOP.is_set():
+                try:
+                    for name, worker in list(MONITOR_WATCHER_THREADS.items()):
+                        if worker.is_alive():
+                            continue
+                        logger.warning("Restarting monitor thread: %s", name)
+                        if name == "server-monitor-loop":
+                            target = _monitor_loop
+                        elif name == "server-monitor-ssh":
+                            target = _service_watcher_loop
+                        elif name == "server-monitor-fail2ban":
+                            target = _fail2ban_watcher_loop
+                        else:
+                            continue
+                        thread = threading.Thread(target=target, args=(bot,), daemon=True, name=name)
+                        MONITOR_WATCHER_THREADS[name] = thread
+                        thread.start()
+                    time.sleep(5)
+                except Exception as exc:
+                    report_local_error("monitor_supervisor", exc)
+                    time.sleep(5)
+
+        threading.Thread(target=_supervisor, daemon=True, name="server-monitor-supervisor").start()
 
 
 def _test_channel(bot) -> bool:
