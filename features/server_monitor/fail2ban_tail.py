@@ -89,44 +89,63 @@ class RealtimeLogFollower:
         self._first_open = False
         self._fp = fp
 
-    def follow(self) -> Iterator[str]:
-        delay = self.retry_min_delay
-        while not self.stop_event.is_set():
-            try:
-                if not self.path:
-                    self.logger.warning("%s path kosong", self.name)
-                    time.sleep(delay)
-                    delay = min(delay * 1.5, self.retry_max_delay)
-                    continue
 
-                path_obj = Path(self.path).expanduser()
-                if not path_obj.exists():
-                    time.sleep(delay)
-                    delay = min(delay * 1.5, self.retry_max_delay)
-                    continue
 
-                if self._should_reopen(path_obj):
-                    self._open(path_obj)
-                    delay = self.retry_min_delay
-
-                assert self._fp is not None
-                line = self._fp.readline()
-                if line:
-                    self._position = self._fp.tell()
-                    delay = self.retry_min_delay
-                    yield line.rstrip("\n")
-                    continue
-
-                if self._should_reopen(path_obj):
-                    self._open(path_obj)
-                    delay = self.retry_min_delay
-                    continue
-
-                time.sleep(self.poll_interval)
-            except Exception as exc:
-                self.logger.exception("RealtimeLogFollower %s error: %s", self.name, exc)
-                self.close()
+def follow(self) -> Iterator[str]:
+    delay = self.retry_min_delay
+    while not self.stop_event.is_set():
+        try:
+            if not self.path:
+                self.logger.warning("[F2B-FOLLOW] path kosong name=%s", self.name)
                 time.sleep(delay)
                 delay = min(delay * 1.5, self.retry_max_delay)
+                continue
 
-        self.close()
+            path_obj = Path(self.path).expanduser()
+            self.logger.warning("[F2B-FOLLOW] tick name=%s path=%s exists=%s fp=%s inode=%s pos=%s delay=%.2f",
+                                self.name,
+                                str(path_obj),
+                                path_obj.exists(),
+                                self._fp is not None,
+                                self._inode,
+                                self._position,
+                                delay)
+
+            if not path_obj.exists():
+                self.logger.warning("[F2B-FOLLOW] path belum ada name=%s path=%s", self.name, str(path_obj))
+                time.sleep(delay)
+                delay = min(delay * 1.5, self.retry_max_delay)
+                continue
+
+            if self._should_reopen(path_obj):
+                self.logger.warning("[F2B-FOLLOW] reopen name=%s path=%s", self.name, str(path_obj))
+                self._open(path_obj)
+                delay = self.retry_min_delay
+                self.logger.warning("[F2B-FOLLOW] opened name=%s inode=%s pos=%s first_open=%s",
+                                    self.name, self._inode, self._position, self._first_open)
+
+            assert self._fp is not None
+            line = self._fp.readline()
+            if line:
+                self._position = self._fp.tell()
+                delay = self.retry_min_delay
+                clean = line.rstrip("\n")
+                self.logger.warning("[F2B-FOLLOW] line name=%s pos=%s len=%s raw=%s",
+                                    self.name, self._position, len(clean), clean[:240])
+                yield clean
+                continue
+
+            if self._should_reopen(path_obj):
+                self.logger.warning("[F2B-FOLLOW] reopen-after-eof name=%s path=%s", self.name, str(path_obj))
+                self._open(path_obj)
+                delay = self.retry_min_delay
+                continue
+
+            time.sleep(self.poll_interval)
+        except Exception as exc:
+            self.logger.exception("[F2B-FOLLOW] error name=%s path=%s exc=%s", self.name, self.path, exc)
+            self.close()
+            time.sleep(delay)
+            delay = min(delay * 1.5, self.retry_max_delay)
+
+    self.close()
