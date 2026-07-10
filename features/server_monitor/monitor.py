@@ -453,20 +453,21 @@ def _event_key(kind: str, ip: str, extra: str = "") -> str:
     return f"{kind}:{ip}:{extra}".strip(":")
 
 
+
 def _fail2ban_register_event_key(event_key: str) -> bool:
     with MONITOR_LOCK:
         order = MONITOR_FAIL2BAN_STATS.setdefault("seen_event_keys", deque())
         seen = MONITOR_FAIL2BAN_STATS.setdefault("seen_event_key_set", set())
         if event_key in seen:
+            logger.warning("F2B DEDUPE: blocked event_key=%s", event_key)
             return False
         order.append(event_key)
         seen.add(event_key)
         while len(order) > 5000:
             old_key = order.popleft()
             seen.discard(old_key)
+        logger.warning("F2B DEDUPE: accepted event_key=%s", event_key)
         return True
-
-
 def allowed(user_id: int) -> bool:
     return OWNER_ID == 0 or user_id == OWNER_ID
 
@@ -593,19 +594,19 @@ def _get_channel_id():
     return None
 
 
+
 def _send_channel_log(bot, text: str) -> bool:
     channel_id = _get_channel_id()
     if channel_id is None:
+        logger.warning("CHANNEL EMPTY: _get_channel_id() returned None/empty")
         return False
     try:
+        logger.warning("CHANNEL SEND: channel_id=%s text=%s", channel_id, _truncate(text, 180))
         bot.send_message(channel_id, text, parse_mode="HTML")
         return True
     except Exception:
         logger.exception("Failed to send channel log to %s", channel_id)
         return False
-
-
-
 def _service_status(service: str) -> Dict[str, Any]:
     unit = _basename_from_service(service)
     state = _exec_text(["systemctl", "is-active", unit], timeout=5).strip() or "unknown"
@@ -1662,25 +1663,15 @@ def _logs_text(snapshot: Dict[str, Any]) -> str:
 
 
 
-def _alerts_text() -> str:
-    channel = _get_channel_id()
-    channel_text = "-" if channel is None else str(channel)
-    return (
-        "🔔 <b>Alerts</b>\n\n"
-        f"Status Monitoring: <b>{'ON' if MONITOR_CONFIG['enabled'] else 'OFF'}</b>\n"
-        f"Channel Log: <code>{_escape(channel_text)}</code>\n\n"
-        f"CPU > <b>{MONITOR_CONFIG['cpu_threshold']}%</b>\n"
-        f"RAM > <b>{MONITOR_CONFIG['ram_threshold']}%</b>\n"
-        f"Disk > <b>{MONITOR_CONFIG['disk_threshold']}%</b>\n"
-        f"CPU Temp > <b>{os.getenv('MONITOR_CPU_TEMP_THRESHOLD', '85')}°C</b>\n"
-        f"Bandwidth Spike > <b>{_fmt_rate(MONITOR_BW_SPIKE_BPS)}</b>\n"
-        f"I/O High > <b>{_fmt_rate(MONITOR_IO_HIGH_BPS)}</b>\n"
-        f"Interval: <b>{MONITOR_CONFIG['interval']}s</b>\n"
-        f"Anti-spam cooldown aktif."
-    )
 
-
-
+def _alert(bot, title: str, body: str, icon: str = "⚠️", cooldown_key: Optional[str] = None, cooldown: int = 600):
+    key = cooldown_key or title
+    with MONITOR_LOCK:
+        if not _can_alert(key, cooldown=cooldown):
+            return False
+    text = f"{icon} <b>{_escape(title)}</b>\n\n{body}\n\n🕒 <code>{_escape(_now_text())}</code>"
+    logger.warning("ALERT SEND: key=%s title=%s body=%s", key, title, _truncate(body, 180))
+    return _send_channel_log(bot, text)
 def _settings_text() -> str:
     channel = _get_channel_id()
     channel_text = "-" if channel is None else str(channel)
@@ -2071,15 +2062,17 @@ def _recover_metric(bot, key: str, title: str, body: str, icon: str = "🟢", co
     return _alert(bot, title, body, icon=icon, cooldown_key=f"{key}:recovery", cooldown=cooldown)
 
 
+
 def _can_alert(key: str, cooldown: int = 600) -> bool:
     now = time.time()
     last = MONITOR_ALERT_LAST_AT.get(key, 0.0)
-    if now - last < cooldown:
+    delta = now - last
+    if delta < cooldown:
+        logger.warning("ALERT COOLDOWN: key=%s blocked delta=%.2f cooldown=%s", key, delta, cooldown)
         return False
     MONITOR_ALERT_LAST_AT[key] = now
+    logger.warning("ALERT COOLDOWN: key=%s allowed delta=%.2f cooldown=%s", key, delta, cooldown)
     return True
-
-
 def _alert(bot, title: str, body: str, icon: str = "⚠️", cooldown_key: Optional[str] = None, cooldown: int = 600):
     key = cooldown_key or title
     with MONITOR_LOCK:
@@ -2281,9 +2274,10 @@ def _evaluate_monitor_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
     # Fail2ban snapshot fallback already handled elsewhere
 
 
-def _emit_channel_event(bot, icon: str, title: str, body: str, cooldown_key: str, cooldown: int = 180) -> None:
-    _alert(bot, title, body, icon=icon, cooldown_key=cooldown_key, cooldown=cooldown)
 
+def _emit_channel_event(bot, icon: str, title: str, body: str, cooldown_key: str, cooldown: int = 180) -> None:
+    logger.warning("EMIT: key=%s title=%s body=%s", cooldown_key, title, _truncate(body, 180))
+    _alert(bot, title, body, icon=icon, cooldown_key=cooldown_key, cooldown=cooldown)
 def _service_state_changed(prev_item: Dict[str, Any], cur_item: Dict[str, Any]) -> bool:
     keys = ("status", "pid", "result", "exec_status", "exec_code", "n_restarts")
     return any(str(prev_item.get(k)) != str(cur_item.get(k)) for k in keys)
@@ -2496,6 +2490,7 @@ def _handle_ssh_event(bot, event: Dict[str, Any]) -> None:
         _emit_channel_event(bot, "📡", "Disconnect", body, f"ssh_disc:{ip}:{user}", cooldown=45)
         return
 
+
 def _handle_fail2ban_event(bot, event: Dict[str, Any]) -> None:
     ip = str(event.get("ip") or "-")
     jail = str(event.get("jail") or "-")
@@ -2505,11 +2500,15 @@ def _handle_fail2ban_event(bot, event: Dict[str, Any]) -> None:
     geo = _lookup_geoip(ip)
 
     dedupe_key = _hash_text(f"{kind}|{jail}|{ip}|{ts}|{raw}")
+    logger.warning("F2B HANDLE: kind=%s jail=%s ip=%s ts=%s key=%s", kind, jail, ip, ts, dedupe_key)
+
     if not _fail2ban_register_event_key(dedupe_key):
+        logger.warning("F2B HANDLE: dedupe blocked kind=%s jail=%s ip=%s", kind, jail, ip)
         return
 
     if kind == "fail2ban_failed":
         MONITOR_FAIL2BAN_STATS["failed_counts"].append((time.time(), jail, ip))
+        logger.warning("F2B HANDLE: stored failed count (no alert) jail=%s ip=%s", jail, ip)
         return
 
     if kind == "fail2ban_restore_ban":
@@ -2553,17 +2552,17 @@ def _handle_fail2ban_event(bot, event: Dict[str, Any]) -> None:
         )
         _emit_channel_event(bot, "🔓", "Fail2Ban Unban", body, f"f2b_unban:{jail}:{ip}", cooldown=90)
         return
-
 def _ssh_journal_parser(bot, line: str) -> None:
     event = _parse_ssh_event(line)
     if event:
         _handle_ssh_event(bot, event)
 
+
 def _fail2ban_journal_parser(bot, line: str) -> None:
     event = _parse_fail2ban_event(line)
+    logger.warning("F2B PARSE: raw=%s event=%s", _truncate(line, 240), event)
     if event:
         _handle_fail2ban_event(bot, event)
-
 def _journal_worker_wrapper(bot, name: str, units: Tuple[str, ...], parser_fn) -> None:
     def _parser(line: str):
         parser_fn(bot, line)
