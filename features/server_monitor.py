@@ -383,29 +383,42 @@ def _message_kind_from_ssh(line: str) -> str:
     return "ssh_other"
 
 def _message_kind_from_fail2ban(line: str) -> str:
-    lowered = line.lower()
-    if " ban " in f" {lowered} " or " ban:" in lowered:
-        return "fail2ban_ban"
-    if " unban " in f" {lowered} " or " unban:" in lowered:
+    lowered = f" {line.lower()} "
+    if re.search(r"\b(unban)\b", lowered):
         return "fail2ban_unban"
-    if " found " in f" {lowered} ":
+    if re.search(r"\b(ban)\b", lowered):
+        return "fail2ban_ban"
+    if re.search(r"\b(found)\b", lowered):
         return "fail2ban_failed"
     return "fail2ban_other"
 
 def _parse_fail2ban_event(line: str) -> Optional[Dict[str, Any]]:
     kind = _message_kind_from_fail2ban(line)
-    jail = "-"
-    ip = "-"
-    m = re.search(r"\[(?P<jail>[^\]]+)\].*?(Ban|Unban|Found)\s+(?P<ip>[0-9a-fA-F:.]+)", line, flags=re.IGNORECASE)
-    if m:
-        jail = m.group("jail")
-        ip = m.group("ip")
-    else:
-        m2 = re.search(r"(Ban|Unban|Found)\s+(?P<ip>[0-9a-fA-F:.]+)", line, flags=re.IGNORECASE)
-        if m2:
-            ip = m2.group("ip")
     if kind == "fail2ban_other":
         return None
+
+    jail = "-"
+    ip = "-"
+
+    # Common formats:
+    #   2026-07-09T... fail2ban.actions[123]: NOTICE [sshd] Ban 1.2.3.4
+    #   2026-07-09T... fail2ban.filter[123]: Found 1.2.3.4 - 2026...
+    #   2026-07-09T... fail2ban.actions[123]: INFO [sshd] Unban 1.2.3.4
+    patterns = [
+        r"\[(?P<jail>[^\]]+)\].*?\b(?:Ban|Unban|Found)\b\s+(?P<ip>[0-9a-fA-F:.]+)",
+        r"jail\s*[:=]\s*(?P<jail>[A-Za-z0-9_.-]+).*?\b(?:Ban|Unban|Found)\b\s+(?P<ip>[0-9a-fA-F:.]+)",
+        r"\b(?:Ban|Unban|Found)\b\s+(?P<ip>[0-9a-fA-F:.]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, line, flags=re.IGNORECASE)
+        if not m:
+            continue
+        if "jail" in m.groupdict() and m.group("jail"):
+            jail = m.group("jail")
+        if m.groupdict().get("ip"):
+            ip = m.group("ip")
+        break
+
     return {
         "kind": kind,
         "jail": jail,
@@ -1011,10 +1024,6 @@ def _fail2ban_snapshot() -> Dict[str, Any]:
 
 
 def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
-    watcher = MONITOR_WATCHER_THREADS.get("server-monitor-fail2ban")
-    if watcher is not None and watcher.is_alive():
-        return
-
     prev_f2b = prev.get("fail2ban") or {}
     cur_f2b = cur.get("fail2ban") or {}
 
@@ -2536,10 +2545,10 @@ def _service_loop_body(bot) -> None:
             time.sleep(10)
 
 def _service_watcher_loop(bot) -> None:
-    _journal_worker_wrapper(bot, "ssh", _service_units("ssh"), _ssh_journal_parser)
+    _journal_worker_wrapper(bot, "ssh", ("ssh", "ssh.service", "sshd", "sshd.service"), _ssh_journal_parser)
 
 def _fail2ban_watcher_loop(bot) -> None:
-    _journal_worker_wrapper(bot, "fail2ban", _service_units("fail2ban"), _fail2ban_journal_parser)
+    _journal_worker_wrapper(bot, "fail2ban", ("fail2ban", "fail2ban.service", "fail2ban-server", "fail2ban-server.service"), _fail2ban_journal_parser)
 
 def _evaluate_service_changes(bot, prev: Dict[str, Any], cur: Dict[str, Any]) -> None:
     prev_services = prev.get("services") or {}
