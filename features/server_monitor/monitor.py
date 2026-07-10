@@ -2604,7 +2604,13 @@ def _service_loop_body(bot) -> None:
 def _service_watcher_loop(bot) -> None:
     _journal_worker_wrapper(bot, "ssh", _service_units("ssh"), _ssh_journal_parser)
 
+
+
 def _fail2ban_watcher_loop(bot) -> None:
+    logger.warning("[F2B-WATCHER] start path=%s stop_set=%s",
+                   FAIL2BAN_LOG_PATH,
+                   MONITOR_WATCHER_STOP.is_set())
+
     follower = RealtimeLogFollower(
         FAIL2BAN_LOG_PATH,
         MONITOR_WATCHER_STOP,
@@ -2615,20 +2621,41 @@ def _fail2ban_watcher_loop(bot) -> None:
         retry_max_delay=10.0,
         seek_to_end_on_start=True,
     )
+
+    logger.warning("[F2B-WATCHER] follower ready seek_to_end_on_start=%s poll_interval=%.2f retry_min=%.2f retry_max=%.2f",
+                   True, 0.5, 1.0, 10.0)
+
     while not MONITOR_WATCHER_STOP.is_set():
         try:
+            logger.warning("[F2B-WATCHER] loop-enter stop_set=%s", MONITOR_WATCHER_STOP.is_set())
             for line in follower.follow():
+                logger.warning("[F2B-WATCHER] yielded line len=%s head=%s",
+                               len(line) if line else 0,
+                               (line or "")[:240])
+
                 if MONITOR_WATCHER_STOP.is_set():
+                    logger.warning("[F2B-WATCHER] stop requested inside loop")
                     break
                 if not line:
+                    logger.warning("[F2B-WATCHER] empty line skipped")
                     continue
+
                 try:
+                    logger.warning("[F2B-WATCHER] parsing line head=%s", line[:240])
                     _fail2ban_journal_parser(bot, line)
                 except Exception as exc:
+                    logger.exception("[F2B-WATCHER] parser error line=%s exc=%s", line[:240], exc)
                     report_local_error("fail2ban_parser", exc)
+
             if MONITOR_WATCHER_STOP.is_set():
+                logger.warning("[F2B-WATCHER] stop exit outer loop")
                 break
+
+            logger.warning("[F2B-WATCHER] follower exhausted, restarting after short sleep")
+            time.sleep(2)
+
         except Exception as exc:
+            logger.exception("[F2B-WATCHER] loop error exc=%s", exc)
             report_local_error("fail2ban_watcher", exc)
             time.sleep(2)
 
