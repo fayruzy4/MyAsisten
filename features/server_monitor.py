@@ -124,6 +124,22 @@ MONITOR_SERVICE_RESTART_MIN_DELTA = max(1, int(os.getenv("MONITOR_SERVICE_RESTAR
 MONITOR_DNS_TEST_HOST = os.getenv("MONITOR_DNS_TEST_HOST", "one.one.one.one")
 MONITOR_DNS_TEST_NAME = os.getenv("MONITOR_DNS_TEST_NAME", "google.com")
 
+try:
+    MONITOR_FAIL2BAN_POLL_INTERVAL = max(1.0, float(os.getenv("MONITOR_FAIL2BAN_POLL_INTERVAL", "1.5")))
+except Exception:
+    MONITOR_FAIL2BAN_POLL_INTERVAL = 1.5
+
+MONITOR_FAIL2BAN_LOG_PATH = os.getenv("MONITOR_FAIL2BAN_LOG_PATH", "/var/log/fail2ban.log")
+MONITOR_FAIL2BAN_LOG_ALIASES: Tuple[str, ...] = tuple(
+    x.strip()
+    for x in (
+        MONITOR_FAIL2BAN_LOG_PATH,
+        "/var/log/fail2ban.log",
+        "/var/log/fail2ban.log.1",
+    )
+    if x and str(x).strip()
+)
+
 def _truncate(value: Any, limit: int = 280) -> str:
     text = "" if value is None else str(value)
     if len(text) <= limit:
@@ -308,6 +324,85 @@ def _journal_tail_worker(name: str, units: Tuple[str, ...], parser):
         time.sleep(delay)
         delay = min(delay * 1.4, 10.0)
 
+def _file_tail_worker(name: str, path: str, parser, start_at_end: bool = True, poll_interval: float = 0.75) -> None:
+    """
+    Tail a local text file robustly across truncation and log rotation.
+
+    - Starts at end by default so we do not replay historical events.
+    - Reopens automatically when inode changes or the file shrinks.
+    - Calls parser(line) for each non-empty line.
+    """
+    delay = max(0.25, float(poll_interval))
+    position: Optional[int] = None
+    last_inode: Optional[int] = None
+
+    while not MONITOR_WATCHER_STOP.is_set():
+        fh = None
+        try:
+            file_path = Path(path).expanduser()
+            if not file_path.exists():
+                time.sleep(delay)
+                delay = min(delay * 1.4, 10.0)
+                continue
+
+            fh = file_path.open("r", encoding="utf-8", errors="replace")
+            try:
+                st = file_path.stat()
+                current_inode = int(getattr(st, "st_ino", 0) or 0)
+                if last_inode is not None and current_inode != last_inode:
+                    position = None
+                last_inode = current_inode
+
+                if position is None:
+                    if start_at_end:
+                        fh.seek(0, os.SEEK_END)
+                    else:
+                        fh.seek(0, os.SEEK_SET)
+                else:
+                    try:
+                        fh.seek(position)
+                    except Exception:
+                        fh.seek(0, os.SEEK_END if start_at_end else os.SEEK_SET)
+
+                while not MONITOR_WATCHER_STOP.is_set():
+                    line = fh.readline()
+                    if line:
+                        position = fh.tell()
+                        line = line.rstrip("\n")
+                        if line:
+                            try:
+                                parser(line)
+                            except Exception as exc:
+                                report_local_error(f"{name}_parser", exc)
+                        continue
+
+                    # No new line; check for rotation/truncation and wait briefly.
+                    try:
+                        st_now = file_path.stat()
+                        inode_now = int(getattr(st_now, "st_ino", 0) or 0)
+                        size_now = int(getattr(st_now, "st_size", 0) or 0)
+                    except Exception:
+                        break
+
+                    if inode_now != last_inode or (position is not None and size_now < position):
+                        position = None
+                        last_inode = inode_now
+                        break
+
+                    time.sleep(delay)
+            finally:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+            delay = max(0.25, float(poll_interval))
+            time.sleep(0.2)
+        except Exception as exc:
+            report_local_error(f"{name}_watcher", exc)
+            time.sleep(delay)
+            delay = min(delay * 1.4, 10.0)
+
 def _ensure_reader_alive(path: str, reader_name: str) -> None:
     try:
         if not path:
@@ -384,13 +479,14 @@ def _message_kind_from_ssh(line: str) -> str:
         return "ssh_disconnect"
     return "ssh_other"
 
+
 def _message_kind_from_fail2ban(line: str) -> str:
     lowered = (line or "").lower()
     if re.search(r"\b(unban|unbanned)\b", lowered) or " unban:" in lowered:
         return "fail2ban_unban"
-    if re.search(r"\bban(ned)?\b", lowered) or " ban:" in lowered:
+    if re.search(r"\b(restore\s+ban|bann?ed|ban)\b", lowered) or " ban:" in lowered:
         return "fail2ban_ban"
-    if re.search(r"\bfound\b", lowered) or re.search(r"\bfail(?:ed|ure)\b", lowered):
+    if re.search(r"\b(found|failure|failed|fail)\b", lowered):
         return "fail2ban_failed"
     return "fail2ban_other"
 
@@ -399,33 +495,37 @@ def _parse_fail2ban_event(line: str) -> Optional[Dict[str, Any]]:
     if kind == "fail2ban_other":
         return None
 
+    text = line or ""
     jail = "-"
     ip = "-"
-    text = line or ""
 
-    m = re.search(r"\[(?P<jail>[^\]]+)\]", text)
-    if m:
-        jail = m.group("jail").strip() or "-"
+    jail_match = re.search(r"\[(?P<jail>[^\]]+)\]", text)
+    if jail_match:
+        jail = jail_match.group("jail").strip() or "-"
 
-    # Common fail2ban formats:
-    #   NOTICE  [sshd] Ban 1.2.3.4
-    #   NOTICE  [sshd] Unban 1.2.3.4
-    #   Found 1.2.3.4
-    #   Ban 1.2.3.4
-    ip_match = re.search(r"\b(?:Ban|Unban|Found|Banned|Unbanned|Failure|Failed)\b[^0-9a-fA-F:.]*([0-9a-fA-F:.]+)", text, flags=re.IGNORECASE)
+    ip_match = re.search(
+        r"\b(?:Ban|Unban|Unbanned|Banned|Found|Failure|Failed|Restore\s+Ban)\b[^0-9a-fA-F:.]*"
+        r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){1,7})",
+        text,
+        flags=re.IGNORECASE,
+    )
     if ip_match:
-        ip = ip_match.group(1)
+        ip = ip_match.group("ip")
     else:
-        ip_match = re.search(r"\b([0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){1,7}|(?:\d{1,3}\.){3}\d{1,3})\b", text)
-        if ip_match:
-            ip = ip_match.group(1)
+        ipv4_match = re.search(r"(?:\d{1,3}\.){3}\d{1,3}", text)
+        if ipv4_match:
+            ip = ipv4_match.group(0)
+        else:
+            ipv6_match = re.search(r"[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){1,7}", text)
+            if ipv6_match:
+                ip = ipv6_match.group(0)
 
     return {
         "kind": kind,
         "jail": jail,
         "ip": ip,
-        "timestamp": _parse_timestamp_text(line),
-        "raw": line,
+        "timestamp": _parse_timestamp_text(text),
+        "raw": text,
     }
 
 def _parse_ssh_event(line: str) -> Optional[Dict[str, Any]]:
@@ -1024,6 +1124,8 @@ def _fail2ban_snapshot() -> Dict[str, Any]:
 
 
 
+
+
 def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
     prev_f2b = prev.get("fail2ban") or {}
     cur_f2b = cur.get("fail2ban") or {}
@@ -1049,38 +1151,36 @@ def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
         new_ips = sorted(cur_ips - prev_ips)
         removed_ips = sorted(prev_ips - cur_ips)
 
-        if new_ips:
+        for ip in new_ips:
             body = (
                 f"Jail: <b>{_escape(jail)}</b>\n"
-                f"IP baru diblokir: <b>{len(new_ips)}</b>\n\n"
-                + "\n".join(f"• <code>{_escape(ip)}</code>" for ip in new_ips[:10])
-                + f"\n\nCurrently failed: <b>{_escape(str(cur_detail.get('failed', 0)))}</b>"
-                + f"\nCurrently banned: <b>{_escape(str(cur_detail.get('banned', len(cur_ips))))}</b>"
-                + f"\nTotal banned: <b>{_escape(str(cur_f2b.get('banned_total', 0)))}</b>"
+                f"IP diblokir: <code>{_escape(ip)}</code>\n"
+                f"Currently failed: <b>{_escape(str(cur_detail.get('failed', 0)))}</b>\n"
+                f"Currently banned: <b>{_escape(str(cur_detail.get('banned', len(cur_ips))))}</b>\n"
+                f"Total banned: <b>{_escape(str(cur_f2b.get('banned_total', 0)))}</b>"
             )
             _alert(
                 bot,
                 "Fail2Ban Ban",
                 body,
                 icon="🔒",
-                cooldown_key=f"fail2ban_new_{jail}",
+                cooldown_key=f"f2b_ban:{jail}:{ip}",
                 cooldown=180,
             )
 
-        if removed_ips:
+        for ip in removed_ips:
             body = (
                 f"Jail: <b>{_escape(jail)}</b>\n"
-                f"IP di-unban: <b>{len(removed_ips)}</b>\n\n"
-                + "\n".join(f"• <code>{_escape(ip)}</code>" for ip in removed_ips[:10])
-                + f"\n\nCurrently banned: <b>{_escape(str(cur_detail.get('banned', len(cur_ips))))}</b>"
-                + f"\nTotal banned: <b>{_escape(str(cur_f2b.get('banned_total', 0)))}</b>"
+                f"IP di-unban: <code>{_escape(ip)}</code>\n"
+                f"Currently banned: <b>{_escape(str(cur_detail.get('banned', len(cur_ips))))}</b>\n"
+                f"Total banned: <b>{_escape(str(cur_f2b.get('banned_total', 0)))}</b>"
             )
             _alert(
                 bot,
                 "Fail2Ban Unban",
                 body,
                 icon="🔓",
-                cooldown_key=f"fail2ban_unban_{jail}",
+                cooldown_key=f"f2b_unban:{jail}:{ip}",
                 cooldown=180,
             )
 
@@ -2565,6 +2665,22 @@ def _service_watcher_loop(bot) -> None:
     _journal_worker_wrapper(bot, "ssh", _service_units("ssh"), _ssh_journal_parser)
 
 def _fail2ban_watcher_loop(bot) -> None:
+    """
+    Fail2Ban on Ubuntu 24.04 commonly writes Ban/Unban events to /var/log/fail2ban.log
+    instead of journald. We tail the file first, and fall back to journald only if the file
+    is unavailable.
+    """
+    for candidate in MONITOR_FAIL2BAN_LOG_ALIASES:
+        try:
+            path = Path(candidate).expanduser()
+            if path.exists() and path.is_file():
+                logger.info("Fail2Ban watcher using log file: %s", path)
+                _file_tail_worker("fail2ban", str(path), _fail2ban_journal_parser, start_at_end=True, poll_interval=MONITOR_FAIL2BAN_POLL_INTERVAL)
+                return
+        except Exception as exc:
+            report_local_error("fail2ban_log_probe", exc)
+
+    logger.info("Fail2Ban log file not found; falling back to journald")
     _journal_worker_wrapper(bot, "fail2ban", _service_units("fail2ban"), _fail2ban_journal_parser)
 
 def _evaluate_service_changes(bot, prev: Dict[str, Any], cur: Dict[str, Any]) -> None:
