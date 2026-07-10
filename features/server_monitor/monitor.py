@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover
 
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .fail2ban_tail import RealtimeLogFollower
 from config import OWNER_ID
 
 try:
@@ -60,6 +61,7 @@ MONITOR_LAST_CORE: Dict[str, Any] = {}
 MONITOR_ALERT_LAST_AT: Dict[str, float] = {}
 MONITOR_LAST_CHANNEL_TEST_AT: float = 0.0
 MONITOR_LOCK = threading.RLock()
+FAIL2BAN_LOG_PATH = (os.getenv("FAIL2BAN_LOG_PATH") or "/var/log/fail2ban.log").strip() or "/var/log/fail2ban.log"
 
 DEFAULT_JOURNAL_SERVICES = {
     "ssh": ("ssh", "sshd"),
@@ -79,7 +81,10 @@ MONITOR_SSH_STATS: Dict[str, Any] = {
 MONITOR_FAIL2BAN_STATS: Dict[str, Any] = {
     "ban_events": deque(maxlen=200),
     "unban_events": deque(maxlen=200),
+    "restore_ban_events": deque(maxlen=200),
     "failed_counts": deque(maxlen=200),
+    "seen_event_keys": deque(),
+    "seen_event_key_set": set(),
     "total_ban": 0,
 }
 MONITOR_NET_BASELINE: Dict[str, Any] = {}
@@ -178,7 +183,9 @@ def _service_units(service: str) -> Tuple[str, ...]:
     service = _basename_from_service(service)
     if service.endswith(".socket") or service.endswith(".timer"):
         return (service,)
-    return (service, f"{service}.service")
+    aliases = list(DEFAULT_JOURNAL_SERVICES.get(service, ()))
+    aliases.extend([service, f"{service}.service"])
+    return tuple(_dedupe_ordered([alias for alias in aliases if alias]))
 
 def _dedupe_ordered(items: List[str]) -> List[str]:
     seen = set()
@@ -331,7 +338,7 @@ def _fail2ban_rate_bucket(jail: str) -> deque:
     return bucket
 
 def _parse_timestamp_text(line: str) -> str:
-    match = re.match(r"^(\d{4}-\d{2}-\d{2}T[^ ]+)\s", line or "")
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}(?:[ T])\d{2}:\d{2}:\d{2}(?:[\.,]\d+)?)\s", line or "")
     if match:
         return match.group(1)
     return _now_text()
@@ -383,29 +390,43 @@ def _message_kind_from_ssh(line: str) -> str:
     return "ssh_other"
 
 def _message_kind_from_fail2ban(line: str) -> str:
-    lowered = line.lower()
-    if " ban " in f" {lowered} " or " ban:" in lowered:
-        return "fail2ban_ban"
-    if " unban " in f" {lowered} " or " unban:" in lowered:
+    lowered = (line or "").lower()
+    if re.search(r"\brestore\s+ban\b", lowered):
+        return "fail2ban_restore_ban"
+    if re.search(r"\b(unban|unbanned)\b", lowered) or " unban:" in lowered:
         return "fail2ban_unban"
-    if " found " in f" {lowered} ":
+    if re.search(r"\bban(ned)?\b", lowered) or " ban:" in lowered:
+        return "fail2ban_ban"
+    if re.search(r"\bfound\b", lowered) or re.search(r"\bfail(?:ed|ure)\b", lowered):
         return "fail2ban_failed"
     return "fail2ban_other"
 
 def _parse_fail2ban_event(line: str) -> Optional[Dict[str, Any]]:
     kind = _message_kind_from_fail2ban(line)
-    jail = "-"
-    ip = "-"
-    m = re.search(r"\[(?P<jail>[^\]]+)\].*?(Ban|Unban|Found)\s+(?P<ip>[0-9a-fA-F:.]+)", line, flags=re.IGNORECASE)
-    if m:
-        jail = m.group("jail")
-        ip = m.group("ip")
-    else:
-        m2 = re.search(r"(Ban|Unban|Found)\s+(?P<ip>[0-9a-fA-F:.]+)", line, flags=re.IGNORECASE)
-        if m2:
-            ip = m2.group("ip")
     if kind == "fail2ban_other":
         return None
+
+    jail = "-"
+    ip = "-"
+    text = line or ""
+
+    m = re.search(r"\[(?P<jail>[^\]]+)\]", text)
+    if m:
+        jail = m.group("jail").strip() or "-"
+
+    # Common fail2ban formats:
+    #   NOTICE  [sshd] Ban 1.2.3.4
+    #   NOTICE  [sshd] Unban 1.2.3.4
+    #   Found 1.2.3.4
+    #   Ban 1.2.3.4
+    ip_match = re.search(r"\b(?:Ban|Unban|Found|Banned|Unbanned|Failure|Failed)\b[^0-9a-fA-F:.]*([0-9a-fA-F:.]+)", text, flags=re.IGNORECASE)
+    if ip_match:
+        ip = ip_match.group(1)
+    else:
+        ip_match = re.search(r"\b([0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){1,7}|(?:\d{1,3}\.){3}\d{1,3})\b", text)
+        if ip_match:
+            ip = ip_match.group(1)
+
     return {
         "kind": kind,
         "jail": jail,
@@ -431,6 +452,19 @@ def _parse_ssh_event(line: str) -> Optional[Dict[str, Any]]:
 def _event_key(kind: str, ip: str, extra: str = "") -> str:
     return f"{kind}:{ip}:{extra}".strip(":")
 
+
+def _fail2ban_register_event_key(event_key: str) -> bool:
+    with MONITOR_LOCK:
+        order = MONITOR_FAIL2BAN_STATS.setdefault("seen_event_keys", deque())
+        seen = MONITOR_FAIL2BAN_STATS.setdefault("seen_event_key_set", set())
+        if event_key in seen:
+            return False
+        order.append(event_key)
+        seen.add(event_key)
+        while len(order) > 5000:
+            old_key = order.popleft()
+            seen.discard(old_key)
+        return True
 
 
 def allowed(user_id: int) -> bool:
@@ -1011,10 +1045,6 @@ def _fail2ban_snapshot() -> Dict[str, Any]:
 
 
 def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
-    watcher = MONITOR_WATCHER_THREADS.get("server-monitor-fail2ban")
-    if watcher is not None and watcher.is_alive():
-        return
-
     prev_f2b = prev.get("fail2ban") or {}
     cur_f2b = cur.get("fail2ban") or {}
 
@@ -2375,8 +2405,11 @@ def _handle_ssh_event(bot, event: Dict[str, Any]) -> None:
     geo = _lookup_geoip(ip)
 
     if kind == "ssh_success":
+        now = time.time()
         MONITOR_SSH_STATS["last_success"] = f"{ts} | {user} | {ip} | {method}"
-        MONITOR_SSH_STATS["session_events"].append((time.time(), "success", ip, user))
+        MONITOR_SSH_STATS["accepted"].append((now, ip, user, method))
+        MONITOR_SSH_STATS["session_events"].append((now, "success", ip, user))
+
         body = (
             f"User: <b>{_escape(user)}</b>\n"
             f"IP: <code>{_escape(ip)}</code>\n"
@@ -2392,11 +2425,13 @@ def _handle_ssh_event(bot, event: Dict[str, Any]) -> None:
         return
 
     if kind == "ssh_failed":
+        now = time.time()
         MONITOR_SSH_STATS["last_failure"] = f"{ts} | {user} | {ip} | {method}"
-        MONITOR_SSH_STATS["failed"].append((time.time(), ip, user, method))
+        MONITOR_SSH_STATS["failed"].append((now, ip, user, method))
         bucket = _ssh_rate_bucket(ip)
-        bucket.append(time.time())
-        recent = [x for x in bucket if time.time() - x <= 60]
+        bucket.append(now)
+        recent = [x for x in bucket if now - x <= 60]
+
         body = (
             f"User: <b>{_escape(user)}</b>\n"
             f"IP: <code>{_escape(ip)}</code>\n"
@@ -2417,6 +2452,17 @@ def _handle_ssh_event(bot, event: Dict[str, Any]) -> None:
                 f"RDNS: <code>{_escape(geo.get('reverse_dns') or '-')}</code>"
             )
             _emit_channel_event(bot, "🚨", "Brute Force", brute_body, f"ssh_bruteforce:{ip}", cooldown=180)
+
+        # Optional mass-login heuristic (e.g. spray attacks across many usernames / IPs)
+        recent_all = [x for x in MONITOR_SSH_STATS["failed"] if now - x[0] <= 60]
+        unique_ips = {item[1] for item in recent_all if item[1] != "-"}
+        if len(recent_all) >= MONITOR_SSH_MASS_LOGIN_THRESHOLD and len(unique_ips) >= 3:
+            mass_body = (
+                f"Failed login: <b>{len(recent_all)}</b> / 60 detik\n"
+                f"Source IP unik: <b>{len(unique_ips)}</b>\n"
+                f"Contoh IP: <code>{_escape(', '.join(sorted(list(unique_ips))[:5]) if unique_ips else '-')}</code>"
+            )
+            _emit_channel_event(bot, "🚨", "Mass Login", mass_body, "ssh_mass_login", cooldown=180)
         return
 
     if kind == "ssh_session_open":
@@ -2455,10 +2501,31 @@ def _handle_fail2ban_event(bot, event: Dict[str, Any]) -> None:
     jail = str(event.get("jail") or "-")
     kind = str(event.get("kind") or "fail2ban_other")
     ts = str(event.get("timestamp") or _now_text())
+    raw = str(event.get("raw") or "")
     geo = _lookup_geoip(ip)
+
+    dedupe_key = _hash_text(f"{kind}|{jail}|{ip}|{ts}|{raw}")
+    if not _fail2ban_register_event_key(dedupe_key):
+        return
 
     if kind == "fail2ban_failed":
         MONITOR_FAIL2BAN_STATS["failed_counts"].append((time.time(), jail, ip))
+        return
+
+    if kind == "fail2ban_restore_ban":
+        MONITOR_FAIL2BAN_STATS["total_ban"] = _safe_int(MONITOR_FAIL2BAN_STATS.get("total_ban"), 0) + 1
+        MONITOR_FAIL2BAN_STATS["restore_ban_events"].append((time.time(), jail, ip))
+        body = (
+            f"Jail: <b>{_escape(jail)}</b>\n"
+            f"IP: <code>{_escape(ip)}</code>\n"
+            f"Negara: <b>{_escape(geo.get('country') or '-')}</b> {geo.get('flag', '🏳️')}\n"
+            f"Kota: <b>{_escape(geo.get('city') or '-')}</b>\n"
+            f"ISP: <b>{_escape(geo.get('isp') or '-')}</b>\n"
+            f"ASN: <b>{_escape(geo.get('asn') or '-')}</b>\n"
+            f"RDNS: <code>{_escape(geo.get('reverse_dns') or '-')}</code>\n"
+            f"Timestamp: <code>{_escape(ts)}</code>"
+        )
+        _emit_channel_event(bot, "♻️", "Fail2Ban Restore Ban", body, f"f2b_restore:{jail}:{ip}", cooldown=90)
         return
 
     if kind == "fail2ban_ban":
@@ -2539,7 +2606,32 @@ def _service_watcher_loop(bot) -> None:
     _journal_worker_wrapper(bot, "ssh", _service_units("ssh"), _ssh_journal_parser)
 
 def _fail2ban_watcher_loop(bot) -> None:
-    _journal_worker_wrapper(bot, "fail2ban", _service_units("fail2ban"), _fail2ban_journal_parser)
+    follower = RealtimeLogFollower(
+        FAIL2BAN_LOG_PATH,
+        MONITOR_WATCHER_STOP,
+        logger,
+        name="fail2ban",
+        poll_interval=0.5,
+        retry_min_delay=1.0,
+        retry_max_delay=10.0,
+        seek_to_end_on_start=True,
+    )
+    while not MONITOR_WATCHER_STOP.is_set():
+        try:
+            for line in follower.follow():
+                if MONITOR_WATCHER_STOP.is_set():
+                    break
+                if not line:
+                    continue
+                try:
+                    _fail2ban_journal_parser(bot, line)
+                except Exception as exc:
+                    report_local_error("fail2ban_parser", exc)
+            if MONITOR_WATCHER_STOP.is_set():
+                break
+        except Exception as exc:
+            report_local_error("fail2ban_watcher", exc)
+            time.sleep(2)
 
 def _evaluate_service_changes(bot, prev: Dict[str, Any], cur: Dict[str, Any]) -> None:
     prev_services = prev.get("services") or {}
@@ -2612,6 +2704,12 @@ def _ensure_monitor_thread(bot):
     _spawn("server-monitor-loop", _monitor_loop)
     _spawn("server-monitor-ssh", _service_watcher_loop)
     _spawn("server-monitor-fail2ban", _fail2ban_watcher_loop)
+    logger.info(
+        "Monitor threads spawned: loop=%s ssh=%s fail2ban=%s",
+        MONITOR_WATCHER_THREADS["server-monitor-loop"].name,
+        MONITOR_WATCHER_THREADS["server-monitor-ssh"].name,
+        MONITOR_WATCHER_THREADS["server-monitor-fail2ban"].name,
+    )
 
     if not MONITOR_SUPERVISOR_STARTED:
         MONITOR_SUPERVISOR_STARTED = True
@@ -2867,177 +2965,3 @@ __all__ = [
     "process_server_monitor_message",
     "clear_pending",
 ]
-
-
-# ==============================
-# PATCHED REALTIME FALLBACK LAYER
-# ==============================
-from copy import deepcopy as _deepcopy
-
-MONITOR_FAIL2BAN_LAST_SNAPSHOT: Optional[Dict[str, Any]] = None
-MONITOR_FAIL2BAN_LAST_EVENT_AT: float = 0.0
-MONITOR_SSH_LAST_EVENT_AT: float = 0.0
-
-def _f2b_diff_and_alert(bot, prev_f2b: Dict[str, Any], cur_f2b: Dict[str, Any]) -> None:
-    if not cur_f2b.get("installed"):
-        return
-
-    prev_details = {
-        item.get("jail"): item
-        for item in (prev_f2b.get("jail_details") or [])
-        if item.get("jail")
-    }
-    cur_details = {
-        item.get("jail"): item
-        for item in (cur_f2b.get("jail_details") or [])
-        if item.get("jail")
-    }
-
-    for jail, cur_detail in cur_details.items():
-        prev_detail = prev_details.get(jail, {})
-        prev_ips = set(prev_detail.get("banned_ips") or [])
-        cur_ips = set(cur_detail.get("banned_ips") or [])
-
-        new_ips = sorted(cur_ips - prev_ips)
-        removed_ips = sorted(prev_ips - cur_ips)
-
-        if new_ips:
-            body = (
-                f"Jail: <b>{_escape(jail)}</b>\n"
-                f"IP baru diblokir: <b>{len(new_ips)}</b>\n\n"
-                + "\n".join(f"• <code>{_escape(ip)}</code>" for ip in new_ips[:10])
-                + f"\n\nCurrently failed: <b>{_escape(str(cur_detail.get('failed', 0)))}</b>"
-                + f"\nCurrently banned: <b>{_escape(str(cur_detail.get('banned', len(cur_ips))))}</b>"
-                + f"\nTotal banned: <b>{_escape(str(cur_f2b.get('banned_total', 0)))}</b>"
-            )
-            _alert(
-                bot,
-                "Fail2Ban Ban",
-                body,
-                icon="🔒",
-                cooldown_key=f"fail2ban_new_{jail}",
-                cooldown=180,
-            )
-
-        if removed_ips:
-            body = (
-                f"Jail: <b>{_escape(jail)}</b>\n"
-                f"IP di-unban: <b>{len(removed_ips)}</b>\n\n"
-                + "\n".join(f"• <code>{_escape(ip)}</code>" for ip in removed_ips[:10])
-                + f"\n\nCurrently banned: <b>{_escape(str(cur_detail.get('banned', len(cur_ips))))}</b>"
-                + f"\nTotal banned: <b>{_escape(str(cur_f2b.get('banned_total', 0)))}</b>"
-            )
-            _alert(
-                bot,
-                "Fail2Ban Unban",
-                body,
-                icon="🔓",
-                cooldown_key=f"fail2ban_unban_{jail}",
-                cooldown=180,
-            )
-
-_ORIG_HANDLE_FAIL2BAN_EVENT = _handle_fail2ban_event
-def _handle_fail2ban_event(bot, event: Dict[str, Any]) -> None:
-    global MONITOR_FAIL2BAN_LAST_EVENT_AT
-    MONITOR_FAIL2BAN_LAST_EVENT_AT = time.time()
-    MONITOR_FAIL2BAN_STATS["last_event_at"] = MONITOR_FAIL2BAN_LAST_EVENT_AT
-    return _ORIG_HANDLE_FAIL2BAN_EVENT(bot, event)
-
-_ORIG_HANDLE_SSH_EVENT = _handle_ssh_event
-def _handle_ssh_event(bot, event: Dict[str, Any]) -> None:
-    global MONITOR_SSH_LAST_EVENT_AT
-    MONITOR_SSH_LAST_EVENT_AT = time.time()
-    MONITOR_SSH_STATS["last_event_at"] = MONITOR_SSH_LAST_EVENT_AT
-    return _ORIG_HANDLE_SSH_EVENT(bot, event)
-
-def _evaluate_fail2ban_alerts(bot, prev: Dict[str, Any], cur: Dict[str, Any]):
-    """
-    Realtime journal watcher sometimes misses events on some VPS images.
-    This override keeps the original diff-based logic, but only suppresses
-    duplicate snapshot alerts for a short grace window after a journal event.
-    """
-    global MONITOR_FAIL2BAN_LAST_SNAPSHOT
-
-    cur_f2b = cur.get("fail2ban") or {}
-    if not cur_f2b.get("installed"):
-        return
-
-    # If journal event already fired very recently, avoid duplicating the same ban/unban.
-    if time.time() - float(MONITOR_FAIL2BAN_STATS.get("last_event_at") or 0.0) < 8.0:
-        MONITOR_FAIL2BAN_LAST_SNAPSHOT = _deepcopy(cur_f2b)
-        return
-
-    prev_f2b = MONITOR_FAIL2BAN_LAST_SNAPSHOT or (prev.get("fail2ban") or {})
-    if not prev_f2b:
-        MONITOR_FAIL2BAN_LAST_SNAPSHOT = _deepcopy(cur_f2b)
-        return
-
-    _f2b_diff_and_alert(bot, prev_f2b, cur_f2b)
-    MONITOR_FAIL2BAN_LAST_SNAPSHOT = _deepcopy(cur_f2b)
-
-def _parse_fail2ban_event(line: str) -> Optional[Dict[str, Any]]:
-    kind = _message_kind_from_fail2ban(line)
-    jail = "-"
-    ip = "-"
-
-    # Common fail2ban formats on Ubuntu 24.04 / systemd journal:
-    # NOTICE  [sshd] Ban 1.2.3.4
-    # INFO    [sshd] Unban 1.2.3.4
-    # ERROR   [sshd] Found 1.2.3.4 - 1 matches in ...
-    m = re.search(r"\[(?P<jail>[^\]]+)\].*?(Ban|Unban|Found|Failure|Warning)\s+(?P<ip>[0-9a-fA-F:.]+)", line, flags=re.IGNORECASE)
-    if m:
-        jail = m.group("jail")
-        ip = m.group("ip")
-    else:
-        m2 = re.search(r"(Ban|Unban|Found|Failure|Warning)\s+(?P<ip>[0-9a-fA-F:.]+)", line, flags=re.IGNORECASE)
-        if m2:
-            ip = m2.group("ip")
-
-    if kind == "fail2ban_other":
-        return None
-
-    return {
-        "kind": kind,
-        "jail": jail,
-        "ip": ip,
-        "timestamp": _parse_timestamp_text(line),
-        "raw": line,
-    }
-
-def _message_kind_from_fail2ban(line: str) -> str:
-    lowered = line.lower()
-    if " unban " in f" {lowered} " or " unban:" in lowered:
-        return "fail2ban_unban"
-    if " ban " in f" {lowered} " or " ban:" in lowered:
-        return "fail2ban_ban"
-    if " found " in f" {lowered} " or " failure " in f" {lowered} ":
-        return "fail2ban_failed"
-    return "fail2ban_other"
-
-def _message_kind_from_ssh(line: str) -> str:
-    lowered = line.lower()
-    if "accepted publickey" in lowered:
-        return "ssh_success"
-    if "accepted password" in lowered:
-        return "ssh_success"
-    if "failed password" in lowered:
-        return "ssh_failed"
-    if "invalid user" in lowered:
-        return "ssh_failed"
-    if "session opened" in lowered:
-        return "ssh_session_open"
-    if "session closed" in lowered:
-        return "ssh_session_close"
-    if "disconnect" in lowered or "received disconnect" in lowered:
-        return "ssh_disconnect"
-    return "ssh_other"
-
-def _journal_cmd(units: Tuple[str, ...], follow: bool = False) -> List[str]:
-    # Keep the original behavior, but make the stream slightly more tolerant.
-    cmd = ["journalctl", "--no-pager", "-o", "short-iso-precise", "-n", "0"]
-    if follow:
-        cmd.append("-f")
-    for unit in units:
-        cmd.extend(["-u", unit])
-    return cmd
-
